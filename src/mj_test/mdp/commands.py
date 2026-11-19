@@ -3,76 +3,252 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import numpy as np
 import torch
-
 from mjlab.managers import CommandTerm, CommandTermCfg
 from mjlab.utils.lab_api.math import (
     matrix_from_quat,
+    quat_apply,
     quat_error_magnitude,
     quat_from_euler_xyz,
     quat_mul,
     sample_uniform,
 )
 from mjlab.viewer.debug_visualizer import DebugVisualizer
+from tensordict import tensorclass
+
+from mj_test.utils.forward_kinematics import ForwardKinematics
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from typing import Any
 
     import viser
-
     from mjlab.entity import Entity
     from mjlab.envs import ManagerBasedRlEnv
 
 
 __all__ = [
-    "Motion",
-    "MotionCfg",
+    "BodyState",
+    "MotionCommand",
+    "MotionCommandCfg",
     "MotionLoader",
+    "RobotState",
+    "Transition",
 ]
 
 _DESIRED_FRAME_COLORS = ((1.0, 0.5, 0.5), (0.5, 1.0, 0.5), (0.5, 0.5, 1.0))
+_FK_CHUNK = 65536
+
+
+@tensorclass
+class RobotState:
+    """Generalized coordinates and velocities of the robot.
+
+    Attributes:
+        root_pos: Root positions relative to the env origin, shape (..., 3).
+        root_quat: Root wxyz quaternions, shape (..., 4).
+        joint_pos: Joint positions, shape (..., J).
+        root_lin_vel: Root linear velocities in the world frame, shape (..., 3).
+        root_ang_vel: Root angular velocities in the world frame, shape (..., 3).
+        joint_vel: Joint velocities, shape (..., J).
+    """
+
+    root_pos: torch.Tensor
+    root_quat: torch.Tensor
+    joint_pos: torch.Tensor
+    root_lin_vel: torch.Tensor
+    root_ang_vel: torch.Tensor
+    joint_vel: torch.Tensor
+
+    @classmethod
+    def from_entity(cls, robot: Entity, env_origins: torch.Tensor) -> RobotState:
+        """Reads the robot state from qpos and qvel.
+
+        Args:
+            robot: The floating-base robot entity.
+            env_origins: Env origins of shape (num_envs, 3).
+
+        Returns:
+            The robot state of every env.
+        """
+        qpos, qvel = robot.data.data.qpos, robot.data.data.qvel
+        root_q = robot.indexing.free_joint_q_adr
+        root_v = robot.indexing.free_joint_v_adr
+        root_quat = qpos[:, root_q[3:7]]
+        return cls(
+            root_pos=qpos[:, root_q[0:3]] - env_origins,
+            root_quat=root_quat,
+            joint_pos=robot.data.joint_pos,
+            root_lin_vel=qvel[:, root_v[0:3]],
+            root_ang_vel=quat_apply(root_quat, qvel[:, root_v[3:6]]),
+            joint_vel=robot.data.joint_vel,
+            batch_size=root_quat.shape[:1],
+        )
+
+
+@tensorclass
+class BodyState:
+    """Poses and velocities of the tracked bodies, anchor first.
+
+    Attributes:
+        pos: Positions relative to the env origin, shape (..., B, 3).
+        quat: World-frame wxyz quaternions, shape (..., B, 4).
+        lin_vel: World-frame linear velocities, shape (..., B, 3).
+        ang_vel: World-frame angular velocities, shape (..., B, 3).
+    """
+
+    pos: torch.Tensor
+    quat: torch.Tensor
+    lin_vel: torch.Tensor
+    ang_vel: torch.Tensor
+
+
+@tensorclass
+class Transition:
+    """Quantities of one env step that the reward and termination terms read.
+
+    Attributes:
+        state: Robot state after the step.
+        body: Tracked bodies of ``state``.
+        ref: Reference bodies at the frame of the step.
+        action: Raw actions of the step, shape (..., A).
+        prev_action: Raw actions of the previous step, shape (..., A).
+        joint_limits: Lower and upper soft joint position limits, shape (..., J, 2).
+    """
+
+    state: RobotState
+    body: BodyState
+    ref: BodyState
+    action: torch.Tensor
+    prev_action: torch.Tensor
+    joint_limits: torch.Tensor
+
+    @classmethod
+    @torch.compile
+    def from_env(cls, env: ManagerBasedRlEnv) -> Transition:
+        """Reads the transition of the current env step from the sim.
+
+        Args:
+            env: The environment, after the physics substeps of the step.
+
+        Returns:
+            The transition of every env.
+        """
+        command = cast(MotionCommand, env.command_manager.get_term("motion"))
+        state = RobotState.from_entity(command.robot, env.scene.env_origins)
+        return cls(
+            state=state,
+            body=command.motion.body_state(state),
+            ref=command.motion.body[command.time_steps],
+            action=env.action_manager.action,
+            prev_action=env.action_manager.prev_action,
+            joint_limits=command.robot.data.soft_joint_pos_limits,
+            batch_size=state.batch_size,
+        )
 
 
 class MotionLoader:
+    """Loads reference motion clips and concatenates them along the frame axis.
+
+    Args:
+        motion_file: Path of one clip, or paths of several clips.
+        fk: Forward kinematics of the tracked bodies.
+        device: Device of the loaded tensors.
+
+    Attributes:
+        state: Reference robot state of every frame, batch size (time_step_total,).
+        body: Reference tracked bodies of every frame, batch size
+            (time_step_total,).
+        fk: Forward kinematics of the tracked bodies.
+        motion_ends: End frame (exclusive) of each clip, shape (num_clips,).
+        time_step_total: Total number of frames.
+    """
+
     def __init__(
-        self, motion_file: str, body_indexes: torch.Tensor, device: str = "cpu"
+        self,
+        motion_file: str | list[str],
+        fk: ForwardKinematics,
+        device: str = "cpu",
     ) -> None:
-        data = np.load(motion_file)
-        self.joint_pos = torch.tensor(
-            data["joint_pos"], dtype=torch.float32, device=device
+        motion_files = [motion_file] if isinstance(motion_file, str) else motion_file
+        clips: list[dict[str, np.ndarray]] = []
+        for path in motion_files:
+            with np.load(path) as data:
+                clips.append(dict(data))
+
+        def cat(arrays: list[np.ndarray]) -> torch.Tensor:
+            return torch.from_numpy(np.concatenate(arrays)).to(
+                device=device, dtype=torch.float32
+            )
+
+        joint_pos = cat([clip["joint_pos"] for clip in clips])
+        self.time_step_total = joint_pos.shape[0]
+        self.state = RobotState(
+            root_pos=cat([clip["body_pos_w"][:, 0] for clip in clips]),
+            root_quat=cat([clip["body_quat_w"][:, 0] for clip in clips]),
+            joint_pos=joint_pos,
+            root_lin_vel=cat([clip["body_lin_vel_w"][:, 0] for clip in clips]),
+            root_ang_vel=cat([clip["body_ang_vel_w"][:, 0] for clip in clips]),
+            joint_vel=cat([clip["joint_vel"] for clip in clips]),
+            batch_size=[self.time_step_total],
         )
-        self.joint_vel = torch.tensor(
-            data["joint_vel"], dtype=torch.float32, device=device
+        self.fk = fk
+        with torch.no_grad():
+            chunks = self.state.split(_FK_CHUNK)
+            self.body = torch.cat([self.body_state(chunk) for chunk in chunks])
+
+        self.motion_ends = torch.as_tensor(
+            np.cumsum([clip["joint_pos"].shape[0] for clip in clips]),
+            dtype=torch.long,
+            device=device,
         )
-        self._body_pos_w = torch.tensor(
-            data["body_pos_w"], dtype=torch.float32, device=device
+
+    def body_state(self, state: RobotState) -> BodyState:
+        """Computes the tracked bodies of a robot state with forward kinematics.
+
+        Args:
+            state: Robot state.
+
+        Returns:
+            The tracked bodies of ``state``.
+        """
+        pos, quat, lin_vel, ang_vel = self.fk(
+            state.root_pos,
+            state.root_quat,
+            state.joint_pos,
+            state.root_lin_vel,
+            state.root_ang_vel,
+            state.joint_vel,
         )
-        self._body_quat_w = torch.tensor(
-            data["body_quat_w"], dtype=torch.float32, device=device
+        return BodyState(
+            pos=pos,
+            quat=quat,
+            lin_vel=lin_vel,
+            ang_vel=ang_vel,
+            batch_size=state.batch_size,
         )
-        self._body_lin_vel_w = torch.tensor(
-            data["body_lin_vel_w"], dtype=torch.float32, device=device
-        )
-        self._body_ang_vel_w = torch.tensor(
-            data["body_ang_vel_w"], dtype=torch.float32, device=device
-        )
-        self._body_indexes = body_indexes
-        self.body_pos_w = self._body_pos_w[:, self._body_indexes]
-        self.body_quat_w = self._body_quat_w[:, self._body_indexes]
-        self.body_lin_vel_w = self._body_lin_vel_w[:, self._body_indexes]
-        self.body_ang_vel_w = self._body_ang_vel_w[:, self._body_indexes]
-        self.time_step_total = self.joint_pos.shape[0]
+
+    def last_frame(self, frames: torch.Tensor) -> torch.Tensor:
+        """Returns the last frame of the clip of each frame.
+
+        Args:
+            frames: Frame indices of any shape, below ``time_step_total``.
+
+        Returns:
+            The last frame indices, of the same shape.
+        """
+        clip = torch.searchsorted(self.motion_ends, frames, right=True)
+        return self.motion_ends[clip] - 1
 
 
-class Motion(CommandTerm):
-    cfg: MotionCfg
+class MotionCommand(CommandTerm):
+    cfg: MotionCommandCfg
     _env: ManagerBasedRlEnv
 
-    def __init__(self, cfg: MotionCfg, env: ManagerBasedRlEnv):
+    def __init__(self, cfg: MotionCommandCfg, env: ManagerBasedRlEnv):
         super().__init__(cfg, env)
 
         self.robot: Entity = env.scene[cfg.entity_name]
@@ -82,31 +258,38 @@ class Motion(CommandTerm):
         self.motion_anchor_body_index = self.cfg.body_names.index(
             self.cfg.anchor_body_name
         )
+        if self.motion_anchor_body_index != 0:
+            raise ValueError("The anchor body must be the first tracked body.")
         self.body_indexes = torch.tensor(
             self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0],
             dtype=torch.long,
             device=self.device,
         )
 
-        self.motion = MotionLoader(
-            self.cfg.motion_file, self.body_indexes, device=self.device
+        fk = ForwardKinematics(
+            env.sim.mj_model,
+            self.robot.indexing.body_ids,
+            self.robot.indexing.joint_q_adr,
+            self.body_indexes,
+            device=self.device,
         )
+        self.motion = MotionLoader(self.cfg.motion_file, fk, device=self.device)
         self.time_steps = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )
 
-        self.bin_count = int(self.motion.time_step_total // (1 / env.step_dt)) + 1
-        self.bin_failed_count = torch.zeros(
-            self.bin_count, dtype=torch.float, device=self.device
+        self.bin_count = int(self.motion.time_step_total // (0.2 / env.step_dt)) + 1
+        self.sampling_probs = torch.full(
+            (self.bin_count,), 1.0 / self.bin_count, device=self.device
         )
-        self._current_bin_failed = torch.zeros(
-            self.bin_count, dtype=torch.float, device=self.device
+        axes = ("x", "y", "z", "roll", "pitch", "yaw")
+        self._pose_ranges = torch.tensor(
+            [cfg.pose_range.get(axis, (0.0, 0.0)) for axis in axes], device=self.device
         )
-        self.kernel = torch.tensor(
-            [self.cfg.adaptive_lambda**i for i in range(self.cfg.adaptive_kernel_size)],
+        self._velocity_ranges = torch.tensor(
+            [cfg.velocity_range.get(axis, (0.0, 0.0)) for axis in axes],
             device=self.device,
         )
-        self.kernel = self.kernel / self.kernel.sum()
 
         self.metrics["error_anchor_pos"] = torch.zeros(
             self.num_envs, device=self.device
@@ -143,53 +326,49 @@ class Motion(CommandTerm):
 
     @property
     def joint_pos(self) -> torch.Tensor:
-        return self.motion.joint_pos[self.time_steps]
+        return self.motion.state.joint_pos[self.time_steps]
 
     @property
     def joint_vel(self) -> torch.Tensor:
-        return self.motion.joint_vel[self.time_steps]
+        return self.motion.state.joint_vel[self.time_steps]
 
     @property
     def body_pos_w(self) -> torch.Tensor:
         return (
-            self.motion.body_pos_w[self.time_steps]
+            self.motion.body.pos[self.time_steps]
             + self._env.scene.env_origins[:, None, :]
         )
 
     @property
     def body_quat_w(self) -> torch.Tensor:
-        return self.motion.body_quat_w[self.time_steps]
+        return self.motion.body.quat[self.time_steps]
 
     @property
     def body_lin_vel_w(self) -> torch.Tensor:
-        return self.motion.body_lin_vel_w[self.time_steps]
+        return self.motion.body.lin_vel[self.time_steps]
 
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
-        return self.motion.body_ang_vel_w[self.time_steps]
+        return self.motion.body.ang_vel[self.time_steps]
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
         return (
-            self.motion.body_pos_w[self.time_steps, self.motion_anchor_body_index]
+            self.motion.body.pos[self.time_steps, self.motion_anchor_body_index]
             + self._env.scene.env_origins
         )
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:
-        return self.motion.body_quat_w[self.time_steps, self.motion_anchor_body_index]
+        return self.motion.body.quat[self.time_steps, self.motion_anchor_body_index]
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
-        return self.motion.body_lin_vel_w[
-            self.time_steps, self.motion_anchor_body_index
-        ]
+        return self.motion.body.lin_vel[self.time_steps, self.motion_anchor_body_index]
 
     @property
     def anchor_ang_vel_w(self) -> torch.Tensor:
-        return self.motion.body_ang_vel_w[
-            self.time_steps, self.motion_anchor_body_index
-        ]
+        return self.motion.body.ang_vel[self.time_steps, self.motion_anchor_body_index]
 
     @property
     def robot_joint_pos(self) -> torch.Tensor:
@@ -266,63 +445,51 @@ class Motion(CommandTerm):
             self.joint_vel - self.robot_joint_vel, dim=-1
         )
 
-    def _adaptive_sampling(self, env_ids: torch.Tensor):
-        episode_failed = self._env.termination_manager.terminated[env_ids]
-        if torch.any(episode_failed):
-            current_bin_index = torch.clamp(
-                (self.time_steps * self.bin_count)
-                // max(self.motion.time_step_total, 1),
-                0,
-                self.bin_count - 1,
-            )
-            fail_bins = current_bin_index[env_ids][episode_failed]
-            self._current_bin_failed[:] = torch.bincount(
-                fail_bins, minlength=self.bin_count
-            )
+    def frame_bins(self, frames: torch.Tensor) -> torch.Tensor:
+        bins = frames * self.bin_count // self.motion.time_step_total
+        return bins.clamp(max=self.bin_count - 1)
 
-        # Sample.
-        sampling_probabilities = (
-            self.bin_failed_count
-            + self.cfg.adaptive_uniform_ratio / float(self.bin_count)
+    def sample_frames(self, num: int) -> torch.Tensor:
+        """Draws start frames from the sampling distribution.
+
+        Args:
+            num: Number of frames.
+
+        Returns:
+            Frames of shape (num,), uniform over the frames that ``frame_bins`` maps
+            to each drawn bin, with the last frame of each clip moved one back.
+        """
+        probs = self.sampling_probs
+        bins = torch.multinomial(probs, num, replacement=True)
+        total, count = self.motion.time_step_total, self.bin_count
+        lo = (bins * total + count - 1) // count
+        hi = ((bins + 1) * total + count - 1) // count
+        offset = sample_uniform(0.0, 1.0, (num,), device=self.device) * (hi - lo)
+        frames = lo + offset.long()
+        frames = torch.where(
+            frames == self.motion.last_frame(frames), frames - 1, frames
         )
-        sampling_probabilities = torch.nn.functional.pad(
-            sampling_probabilities.unsqueeze(0).unsqueeze(0),
-            (0, self.cfg.adaptive_kernel_size - 1),  # Non-causal kernel
-            mode="replicate",
+
+        entropy = -(probs * (probs + 1e-12).log()).sum()
+        self.metrics["sampling_entropy"][:] = (
+            entropy / math.log(count) if count > 1 else 1.0
         )
-        sampling_probabilities = torch.nn.functional.conv1d(
-            sampling_probabilities, self.kernel.view(1, 1, -1)
-        ).view(-1)
-
-        sampling_probabilities = sampling_probabilities / sampling_probabilities.sum()
-
-        sampled_bins = torch.multinomial(
-            sampling_probabilities, len(env_ids), replacement=True
-        )
-        self.time_steps[env_ids] = (
-            (
-                sampled_bins
-                + sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device)
-            )
-            / self.bin_count
-            * (self.motion.time_step_total - 1)
-        ).long()
-
-        # Update metrics.
-        H = -(sampling_probabilities * (sampling_probabilities + 1e-12).log()).sum()
-        H_norm = H / math.log(self.bin_count) if self.bin_count > 1 else 1.0
-        pmax, imax = sampling_probabilities.max(dim=0)
-        self.metrics["sampling_entropy"][:] = H_norm
+        pmax, imax = probs.max(dim=0)
         self.metrics["sampling_top1_prob"][:] = pmax
-        self.metrics["sampling_top1_bin"][:] = imax.float() / self.bin_count
+        self.metrics["sampling_top1_bin"][:] = imax.float() / count
+        return frames
 
-    def _uniform_sampling(self, env_ids: torch.Tensor):
-        self.time_steps[env_ids] = torch.randint(
-            0, self.motion.time_step_total, (len(env_ids),), device=self.device
-        )
-        self.metrics["sampling_entropy"][:] = 1.0  # Maximum entropy for uniform.
-        self.metrics["sampling_top1_prob"][:] = 1.0 / self.bin_count
-        self.metrics["sampling_top1_bin"][:] = 0.5  # No specific bin preference.
+    def set_sampling_distribution(self, probs: torch.Tensor) -> None:
+        """Sets the distribution of the start bins, ignoring invalid inputs.
+
+        Args:
+            probs: Unnormalized nonnegative bin weights of shape (bin_count,).
+        """
+        probs = probs.detach().to(self.device, dtype=torch.float).clamp_min(0.0)
+        total = probs.sum()
+        if probs.numel() != self.bin_count or not torch.isfinite(total) or total <= 0:
+            return
+        self.sampling_probs = probs / total
 
     def _write_reference_state_to_sim(
         self,
@@ -343,24 +510,14 @@ class Motion(CommandTerm):
         self.robot.reset(env_ids=env_ids)
 
     def _resample_command(self, env_ids: torch.Tensor):
-        if self.cfg.sampling_mode == "start":
-            self.time_steps[env_ids] = 0
-        elif self.cfg.sampling_mode == "uniform":
-            self._uniform_sampling(env_ids)
-        else:
-            assert self.cfg.sampling_mode == "adaptive"
-            self._adaptive_sampling(env_ids)
+        self.time_steps[env_ids] = self.sample_frames(len(env_ids))
 
         root_pos = self.body_pos_w[env_ids, 0].clone()
         root_ori = self.body_quat_w[env_ids, 0].clone()
         root_lin_vel = self.body_lin_vel_w[env_ids, 0].clone()
         root_ang_vel = self.body_ang_vel_w[env_ids, 0].clone()
 
-        range_list = [
-            self.cfg.pose_range.get(key, (0.0, 0.0))
-            for key in ["x", "y", "z", "roll", "pitch", "yaw"]
-        ]
-        ranges = torch.tensor(range_list, device=self.device)
+        ranges = self._pose_ranges
         rand_samples = sample_uniform(
             ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device
         )
@@ -369,11 +526,7 @@ class Motion(CommandTerm):
             rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5]
         )
         root_ori = quat_mul(orientations_delta, root_ori)
-        range_list = [
-            self.cfg.velocity_range.get(key, (0.0, 0.0))
-            for key in ["x", "y", "z", "roll", "pitch", "yaw"]
-        ]
-        ranges = torch.tensor(range_list, device=self.device)
+        ranges = self._velocity_ranges
         rand_samples = sample_uniform(
             ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device
         )
@@ -405,17 +558,6 @@ class Motion(CommandTerm):
             self.time_steps += 1
         else:
             self.time_steps[env_ids] += 1
-        wrap_ids = torch.where(self.time_steps >= self.motion.time_step_total)[0]
-        if wrap_ids.numel() > 0:
-            self._resample_command(wrap_ids)
-            self._env.sim.forward()
-
-        if env_ids is None and self.cfg.sampling_mode == "adaptive":
-            self.bin_failed_count = (
-                self.cfg.adaptive_alpha * self._current_bin_failed
-                + (1 - self.cfg.adaptive_alpha) * self.bin_failed_count
-            )
-            self._current_bin_failed.zero_()
 
     def _debug_vis_impl(self, visualizer: DebugVisualizer) -> None:
         """Draw ghost robot or frames based on visualization mode."""
@@ -581,19 +723,14 @@ class Motion(CommandTerm):
 
 
 @dataclass(kw_only=True)
-class MotionCfg(CommandTermCfg):
-    motion_file: str
+class MotionCommandCfg(CommandTermCfg):
+    motion_file: str | list[str]
     anchor_body_name: str
     body_names: tuple[str, ...]
     entity_name: str
     pose_range: dict[str, tuple[float, float]] = field(default_factory=dict)
     velocity_range: dict[str, tuple[float, float]] = field(default_factory=dict)
     joint_position_range: tuple[float, float] = (-0.52, 0.52)
-    adaptive_kernel_size: int = 1
-    adaptive_lambda: float = 0.8
-    adaptive_uniform_ratio: float = 0.1
-    adaptive_alpha: float = 0.001
-    sampling_mode: Literal["adaptive", "uniform", "start"] = "adaptive"
 
     @dataclass
     class VizCfg:
@@ -602,5 +739,5 @@ class MotionCfg(CommandTermCfg):
 
     viz: VizCfg = field(default_factory=VizCfg)
 
-    def build(self, env: ManagerBasedRlEnv) -> Motion:
-        return Motion(self, env)
+    def build(self, env: ManagerBasedRlEnv) -> MotionCommand:
+        return MotionCommand(self, env)
