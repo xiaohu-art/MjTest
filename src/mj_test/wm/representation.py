@@ -7,15 +7,12 @@ import math
 import torch
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply, quat_apply_inverse
 
-from mj_test.mdp.commands import RobotState
+from mj_test.mdp.motion import RobotState
 from mj_test.utils.math import projected_gravity, quat_integrate
 
 
 def local_state(state: RobotState) -> torch.Tensor:
     """Expresses the robot state in the root frame, without the root xy and yaw.
-
-    Args:
-        state: Robot state.
 
     Returns:
         ``[root z, gravity_b, lin_vel_b, ang_vel_b, joint_pos, joint_vel]`` of shape
@@ -49,10 +46,9 @@ def proprio(
         default_joint_pos: Default joint positions, shape (J,) or (..., J).
 
     Returns:
-        The terms of the env's ``proprio`` observation group, keyed by term name:
-        ``projected_gravity`` and ``base_ang_vel`` of shape (..., 3), ``joint_pos``
-        (``joint_pos + encoder_bias - default_joint_pos``) and ``joint_vel`` of
-        shape (..., J), and ``actions`` of shape (..., A).
+        The terms keyed by name: ``projected_gravity`` and ``base_ang_vel`` of shape
+        (..., 3), ``joint_pos`` (``joint_pos + encoder_bias - default_joint_pos``) and
+        ``joint_vel`` of shape (..., J), and ``actions`` of shape (..., A).
     """
     return {
         "projected_gravity": projected_gravity(state.root_quat),
@@ -64,45 +60,19 @@ def proprio(
 
 
 def actor_obs(proprio_obs: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
-    """Builds the actor input from the proprioceptive observation and the goal.
-
-    Args:
-        proprio_obs: Proprioceptive observation of shape (..., proprio_dim).
-        goal: Goal of shape (..., goal_dim).
-
-    Returns:
-        ``[proprio_obs, goal]`` of shape (..., proprio_dim + goal_dim).
-    """
+    """Builds the actor input ``[proprio_obs, goal]``."""
     return torch.cat([proprio_obs, goal], dim=-1)
 
 
 def critic_obs(
     state: RobotState, goal: torch.Tensor, sim_ctx: torch.Tensor
 ) -> torch.Tensor:
-    """Builds the critic input from the robot state, the goal and the sim context.
-
-    Args:
-        state: Robot state.
-        goal: Goal of shape (..., goal_dim).
-        sim_ctx: Normalized sim context of shape (..., sim_ctx_dim).
-
-    Returns:
-        ``[local_state, goal, sim_ctx]`` of shape
-        (..., state_dim + goal_dim + sim_ctx_dim).
-    """
+    """Builds the critic input ``[local_state, goal, sim_ctx]``."""
     return torch.cat([local_state(state), goal, sim_ctx], dim=-1)
 
 
 def delta_dim(state: RobotState) -> int:
-    """Returns the size of the delta that ``integrate`` consumes.
-
-    Args:
-        state: Robot state.
-
-    Returns:
-        ``6 + J``: the body-frame root linear and angular velocity deltas and the
-        joint velocity deltas.
-    """
+    """Returns the size ``6 + J`` of the delta that ``integrate`` consumes."""
     return 3 + 3 + state.joint_pos.shape[-1]
 
 
@@ -117,9 +87,6 @@ def integrate(
             velocity deltas, shape (..., 6 + J).
         dt: Env step duration in seconds.
         c: Weight of the velocity delta in the pose update.
-
-    Returns:
-        The robot state after the step.
     """
     dv = quat_apply(state.root_quat, delta[..., 0:3])
     dw = quat_apply(state.root_quat, delta[..., 3:6])
@@ -137,9 +104,6 @@ def integrate(
 
 def loss_blocks(state: RobotState) -> dict[str, torch.Tensor]:
     """Splits the robot state into the blocks of the world model loss.
-
-    Args:
-        state: Robot state.
 
     Returns:
         The root position (..., 3), the flattened root rotation matrix times

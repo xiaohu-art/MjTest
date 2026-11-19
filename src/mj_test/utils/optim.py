@@ -17,12 +17,6 @@ def build_optimizers(
 ) -> list[torch.optim.Optimizer]:
     """Builds Muon for hidden Linear weights and Adam for all other parameters.
 
-    Args:
-        modules: Modules whose parameters are optimized.
-        lr: Learning rate of both optimizers.
-        betas: Adam betas.
-        device: Device of Adam's learning rate tensor.
-
     Returns:
         Adam, followed by Muon when any hidden weight exists.
     """
@@ -100,15 +94,7 @@ class CapturedUpdate:
         self._stream: torch.cuda.Stream | None = None
 
     def __call__(self, inputs: TensorDict) -> dict[str, torch.Tensor]:
-        """Runs the update on ``inputs``.
-
-        Args:
-            inputs: Inputs of the update, with the same keys and shapes on every
-                call.
-
-        Returns:
-            The statistics of the update.
-        """
+        """Runs the update on ``inputs``, with fixed keys and shapes across calls."""
         if inputs.device is None or inputs.device.type != "cuda":
             return self._fn(inputs)
         if self._inputs is None:

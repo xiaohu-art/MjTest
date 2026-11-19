@@ -10,37 +10,22 @@ from torch import nn
 
 if TYPE_CHECKING:
     from mjlab.entity import Entity
-    from mjlab.envs import ManagerBasedRlEnv
+
+    from mj_test.envs.sim_env import SimEnv
 
 _DEGENERATE_HALF_WIDTH = 1e-3
 
 
 def _mean_scale(lo: float, hi: float) -> tuple[float, float]:
-    """Computes the normalization of one randomization range.
-
-    Args:
-        lo: Lower bound of the range.
-        hi: Upper bound of the range.
-
-    Returns:
-        The range center and half-width.
-    """
+    """Computes the center and half-width of one randomization range."""
     if hi < lo:
         raise ValueError(f"Empty range: lo={lo}, hi={hi}.")
     half = (hi - lo) / 2.0
     return (lo + hi) / 2.0, half if half > _DEGENERATE_HALF_WIDTH else 1.0
 
 
-def _event_params(env: ManagerBasedRlEnv, name: str) -> dict[str, Any]:
-    """Returns the parameters of a domain randomization event.
-
-    Args:
-        env: The environment.
-        name: Name of the event term.
-
-    Returns:
-        The event's parameter dictionary.
-    """
+def _event_params(env: SimEnv, name: str) -> dict[str, Any]:
+    """Returns the parameters of a domain randomization event."""
     event_cfg = env.cfg.events.get(name)
     if event_cfg is None:
         raise RuntimeError(f"No event '{name}' in env.cfg.events.")
@@ -62,16 +47,7 @@ def _operation_name(params: dict[str, Any], default: str) -> str:
 
 
 def _global_id(asset: Entity, kind: str, local_id: int) -> int:
-    """Converts an entity-local body or geom index to its MuJoCo model id.
-
-    Args:
-        asset: The entity that owns the element.
-        kind: Either ``"body"`` or ``"geom"``.
-        local_id: Index of the element within the entity.
-
-    Returns:
-        The element's id in the MuJoCo model.
-    """
+    """Converts an entity-local body or geom index to its MuJoCo model id."""
     ids = asset.indexing.body_ids if kind == "body" else asset.indexing.geom_ids
     return int(ids[local_id])
 
@@ -88,26 +64,12 @@ class SimContextSpec(ABC):
     dim: int
 
     @abstractmethod
-    def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
-        """Resolves model indices and returns the randomization range per column.
-
-        Args:
-            env: The environment.
-
-        Returns:
-            One ``(lo, hi)`` range per context column.
-        """
+    def bind(self, env: SimEnv) -> list[tuple[float, float]]:
+        """Resolves model indices and returns the ``(lo, hi)`` range of each column."""
 
     @abstractmethod
-    def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
-        """Reads the raw per-env values.
-
-        Args:
-            env: The environment.
-
-        Returns:
-            Raw values of shape (num_envs, dim).
-        """
+    def read(self, env: SimEnv) -> torch.Tensor:
+        """Reads the raw values of shape (num_envs, dim)."""
 
 
 class FootFrictionSpec(SimContextSpec):
@@ -119,7 +81,7 @@ class FootFrictionSpec(SimContextSpec):
     def __init__(self) -> None:
         self._geom_id: int | None = None
 
-    def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
+    def bind(self, env: SimEnv) -> list[tuple[float, float]]:
         params = _event_params(env, self.name)
         if _operation_name(params, "abs") != "abs":
             raise ValueError(
@@ -137,7 +99,7 @@ class FootFrictionSpec(SimContextSpec):
         ranges = params["ranges"]
         return [ranges[0] if isinstance(ranges, dict) else ranges]
 
-    def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    def read(self, env: SimEnv) -> torch.Tensor:
         if self._geom_id is None:
             raise RuntimeError("FootFrictionSpec.read() called before bind().")
         return env.sim.model.geom_friction[:, self._geom_id : self._geom_id + 1, 0]
@@ -153,7 +115,7 @@ class CoMOffsetSpec(SimContextSpec):
         self._body_id: int | None = None
         self._origin: torch.Tensor | None = None
 
-    def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
+    def bind(self, env: SimEnv) -> list[tuple[float, float]]:
         params = _event_params(env, self.name)
         asset_cfg = params["asset_cfg"]
         if len(asset_cfg.body_names) != 1:
@@ -181,7 +143,7 @@ class CoMOffsetSpec(SimContextSpec):
             return [ranges.get(axis, (0.0, 0.0)) for axis in range(self.dim)]
         return [ranges] * self.dim
 
-    def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    def read(self, env: SimEnv) -> torch.Tensor:
         if self._body_id is None or self._origin is None:
             raise RuntimeError("CoMOffsetSpec.read() called before bind().")
         return env.sim.model.body_ipos[:, self._body_id, :] - self._origin
@@ -196,13 +158,13 @@ class EncoderBiasSpec(SimContextSpec):
     def __init__(self) -> None:
         self._asset_name: str | None = None
 
-    def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
+    def bind(self, env: SimEnv) -> list[tuple[float, float]]:
         params = _event_params(env, self.name)
         self._asset_name = params["asset_cfg"].name
         self.dim = env.scene[self._asset_name].num_joints
         return [params["bias_range"]] * self.dim
 
-    def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    def read(self, env: SimEnv) -> torch.Tensor:
         if self._asset_name is None:
             raise RuntimeError("EncoderBiasSpec.read() called before bind().")
         return env.scene[self._asset_name].data.encoder_bias
@@ -226,15 +188,8 @@ class SimContext(nn.Module):
         self.register_buffer("scale", torch.tensor([s for _, s in stats]))
 
     @classmethod
-    def from_env(cls, env: ManagerBasedRlEnv) -> SimContext:
-        """Builds and binds the specs of the env's active randomization events.
-
-        Args:
-            env: The environment.
-
-        Returns:
-            The simulation context on the env's device.
-        """
+    def from_env(cls, env: SimEnv) -> SimContext:
+        """Builds and binds the specs of the env's active randomization events."""
         candidates: tuple[type[SimContextSpec], ...] = (
             FootFrictionSpec,
             CoMOffsetSpec,
@@ -254,15 +209,8 @@ class SimContext(nn.Module):
         """Number of context columns."""
         return sum(spec.dim for spec in self.specs)
 
-    def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
-        """Reads the normalized context of every env.
-
-        Args:
-            env: The environment.
-
-        Returns:
-            Normalized context of shape (num_envs, dim), in spec order.
-        """
+    def read(self, env: SimEnv) -> torch.Tensor:
+        """Reads the normalized context of shape (num_envs, dim), in spec order."""
         raw = torch.cat([spec.read(env) for spec in self.specs], dim=-1)
         return (raw - self.mean) / self.scale
 

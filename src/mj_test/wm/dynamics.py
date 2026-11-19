@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from mj_test.mdp.commands import RobotState
+from mj_test.mdp.motion import RobotState
 from mj_test.utils.mlp import build_mlp
 from mj_test.utils.normalization import EmpiricalNormalization
 from mj_test.wm.representation import integrate, local_state
@@ -15,11 +15,7 @@ from mj_test.wm.representation import integrate, local_state
 
 @dataclass
 class DynamicsCfg:
-    """Hyperparameters of the dynamics network.
-
-    Attributes:
-        hidden_dims: Hidden layer widths of the MLP.
-    """
+    """Hyperparameters of the dynamics network."""
 
     hidden_dims: tuple[int, ...] = (2048, 2048, 2048)
 
@@ -66,14 +62,7 @@ class Dynamics(nn.Module):
         )
 
     def joint_pos_target(self, action: torch.Tensor) -> torch.Tensor:
-        """Maps raw policy actions to the joint position targets sent to the PD.
-
-        Args:
-            action: Raw actions of shape (..., action_dim).
-
-        Returns:
-            Joint position targets of shape (..., action_dim).
-        """
+        """Maps raw actions to the joint position targets of the PD controllers."""
         return action * self.action_scale + self.action_offset
 
     def forward(
@@ -82,16 +71,7 @@ class Dynamics(nn.Module):
         action: torch.Tensor,
         sim_ctx: torch.Tensor,
     ) -> RobotState:
-        """Predicts the robot state after one env step.
-
-        Args:
-            state: Current robot state.
-            action: Raw actions of shape (..., action_dim).
-            sim_ctx: Normalized sim context of shape (..., sim_ctx_dim).
-
-        Returns:
-            The next robot state.
-        """
+        """Predicts the robot state after one env step."""
         state_norm = self.state_normalizer(local_state(state))
         action_norm = self.action_normalizer(self.joint_pos_target(action))
         delta = self.network(torch.cat([state_norm, action_norm, sim_ctx], dim=-1))

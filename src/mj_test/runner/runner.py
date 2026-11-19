@@ -7,24 +7,22 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal
 
 import torch
-from mjlab.envs import ManagerBasedRlEnv
 from mjlab.utils.os import dump_yaml
 from tensordict import TensorDict
 from torch.utils.tensorboard import SummaryWriter
 
-from mj_test.mdp.commands import MotionCommand, RobotState
+from mj_test.envs.imagination_env import ImaginationEnv
+from mj_test.envs.sim_env import SimEnv
 from mj_test.policy.learner import ActorCriticPolicyLearner, ActorCriticPolicyLearnerCfg
 from mj_test.policy.networks import Actor, ActorCfg, Critic, CriticCfg
 from mj_test.runner.replay_buffer import FieldSpec, ReplayBuffer
 from mj_test.runner.return_sampler import ReturnSampler, ReturnSamplerCfg
 from mj_test.wm.dynamics import Dynamics, DynamicsCfg
-from mj_test.wm.imagination import ImaginationEnv
 from mj_test.wm.learner import WorldModelLearner, WorldModelLearnerCfg
-from mj_test.wm.representation import actor_obs, delta_dim, local_state
-from mj_test.wm.sim_context import SimContext
+from mj_test.wm.representation import delta_dim, local_state
 
 
 @dataclass
@@ -51,22 +49,14 @@ class RunnerCfg:
 
 
 class Ratio:
-    """Converts a fractional number of updates per step into whole updates.
-
-    Args:
-        ratio: Updates per step.
-    """
+    """Converts a fractional number of updates per step into whole updates."""
 
     def __init__(self, ratio: float) -> None:
         self._ratio = ratio
         self._credit = 0.0
 
     def __call__(self) -> int:
-        """Advances by one step and returns the number of updates due.
-
-        Returns:
-            The whole part of the accumulated updates, which is spent.
-        """
+        """Advances by one step and returns the whole number of updates due."""
         self._credit += self._ratio
         repeats = int(self._credit)
         self._credit -= repeats
@@ -77,31 +67,30 @@ class Runner:
     """Trains the world model and the policy on transitions collected from the env.
 
     Args:
-        env: The tracking env.
+        env: The simulated tracking env.
         cfg: Runner hyperparameters.
         log_dir: Directory of the logs and checkpoints. None for a runner that only
             loads checkpoints.
     """
 
     def __init__(
-        self, env: ManagerBasedRlEnv, cfg: RunnerCfg, log_dir: Path | None = None
+        self, env: SimEnv, cfg: RunnerCfg, log_dir: Path | None = None
     ) -> None:
         self.env = env
         self.cfg = cfg
         self.log_dir = log_dir
         self.iteration = 0
         self.device = env.device
-        self.command = cast(MotionCommand, env.command_manager.get_term("motion"))
-        self.sim_context = SimContext.from_env(env)
+        self.sim_context = env.sim_context
 
         self.obs, _ = env.reset()
-        state = RobotState.from_dict(self.obs["state"], batch_dims=1)
+        state = env.robot_state
         state_dim = local_state(state).shape[-1]
-        goal_dim = self.obs["goal"].shape[-1]
-        proprio_dim = self.obs["proprio"].shape[-1]
+        goal_dim = env.goal().shape[-1]
+        proprio_dim = self.obs["actor"].shape[-1] - goal_dim
         sim_ctx_dim = self.sim_context.dim
-        action_dim = env.action_manager.total_action_dim
-        action_term = env.action_manager.get_term(env.action_manager.active_terms[0])
+        action_term = env.action_term
+        action_dim = action_term.action_dim
         action_shape = (env.num_envs, action_dim)
         scale = torch.as_tensor(action_term.scale, device=self.device).expand(
             action_shape
@@ -118,16 +107,16 @@ class Runner:
             delta_dim(state),
             scale.float(),
             offset.float(),
-            dt=env.step_dt,
+            dt=env.dt,
             substep_coeff=(decimation + 1) / (2 * decimation),
             **asdict(cfg.dynamics),
         ).to(self.device)
         self.actor = Actor(proprio_dim, goal_dim, action_dim, **asdict(cfg.actor)).to(
             self.device
         )
-        self.critic = Critic(
-            state_dim + goal_dim + sim_ctx_dim, **asdict(cfg.critic)
-        ).to(self.device)
+        self.critic = Critic(self.obs["critic"].shape[-1], **asdict(cfg.critic)).to(
+            self.device
+        )
 
         schema = {
             name: FieldSpec(value.shape[-1]) for name, value in state.to_dict().items()
@@ -141,16 +130,14 @@ class Runner:
         }
         self.buffer = ReplayBuffer(schema, cfg.buffer_size, env.num_envs, self.device)
         self.wm_learner = WorldModelLearner(self.dynamics, cfg.wm)
-        self.imagination = ImaginationEnv(
-            env, self.dynamics, self.sim_context, cfg.termination_softness
-        )
+        self.imagination = ImaginationEnv(env, self.dynamics, cfg.termination_softness)
         self.policy_learner = ActorCriticPolicyLearner(
             self.actor, self.critic, self.imagination, cfg.policy
         )
         self.sampler = (
             ReturnSampler(
                 cfg.return_sampler,
-                self.command.bin_count,
+                env.bin_count,
                 env.num_envs,
                 self.imagination.max_step_reward,
                 self.device,
@@ -158,13 +145,6 @@ class Runner:
             if cfg.sampling == "return"
             else None
         )
-
-        self._episode_return = torch.zeros(env.num_envs, device=self.device)
-        self._episode_length = torch.zeros(env.num_envs, device=self.device)
-        self._finished_return = torch.zeros((), device=self.device)
-        self._finished_length = torch.zeros((), device=self.device)
-        self._finished_count = torch.zeros((), device=self.device)
-        self._episode_logs: list[dict[str, float | torch.Tensor]] = []
 
     def run(self) -> None:
         """Runs ``max_iterations`` more iterations of collection and updates."""
@@ -216,11 +196,10 @@ class Runner:
     def collect(self) -> None:
         """Steps the env once with the noisy actor and stores the transition."""
         env = self.env
-        state = RobotState.from_dict(self.obs["state"], batch_dims=1).clone()
-        frame = self.command.time_steps.clone()
-        prev_action = env.action_manager.action.clone()
-        sim_ctx = self.sim_context.read(env)
-        obs = actor_obs(self.obs["proprio"], self.obs["goal"])
+        state = env.robot_state.clone()
+        frame = env.frames.clone()
+        prev_action = env.action.clone()
+        obs = self.obs["actor"]
         action = self.actor(obs)
         action = action + self.cfg.action_noise * torch.randn_like(action)
 
@@ -233,7 +212,7 @@ class Runner:
                     "action": action,
                     "prev_action": prev_action,
                     "frame": frame,
-                    "sim_ctx": sim_ctx,
+                    "sim_ctx": env.sim_ctx,
                     "terminated": fell,
                     "truncated": truncated,
                 },
@@ -244,18 +223,17 @@ class Runner:
         self.actor.update_normalization(obs)
 
         if self.sampler is not None:
-            clip_end = env.termination_manager.get_term("motion_end")
+            clip_end = extras["clip_end"]
             probs = self.sampler.record(
-                self.command.frame_bins(frame),
-                self.command.frame_bins(frame + 1),
+                env.frame_bins(frame),
+                env.frame_bins(frame + 1),
                 reward,
                 fell,
                 clip_end,
                 truncated & ~clip_end,
             )
             if probs is not None:
-                self.command.set_sampling_distribution(probs)
-        self._track_episodes(reward, terminated | truncated, extras)
+                env.set_sampling_distribution(probs)
 
     def save(self) -> None:
         """Saves the configuration and the training state to the log directory."""
@@ -275,7 +253,7 @@ class Runner:
                 for name, optimizers in self._optimizers().items()
             },
             "return_sampler": sampler,
-            "sampling_probs": self.command.sampling_probs,
+            "sampling_probs": self.env.sampling_probs,
         }
         path = self.log_dir / "model.pt"
         torch.save(checkpoint, path.with_suffix(".tmp"))
@@ -308,30 +286,21 @@ class Runner:
                 optimizer.load_state_dict(state)
         if self.sampler is not None and checkpoint["return_sampler"] is not None:
             self.sampler.load_state_dict(checkpoint["return_sampler"])
-            self.command.set_sampling_distribution(checkpoint["sampling_probs"])
+            self.env.set_sampling_distribution(checkpoint["sampling_probs"])
         self.iteration = checkpoint["iteration"]
 
     def get_inference_policy(self) -> Callable[[dict], torch.Tensor]:
-        """Returns the deterministic actor as a function of the env observations.
-
-        Returns:
-            A function from the env observations to raw actions of shape
-            (num_envs, action_dim).
-        """
+        """Returns the deterministic actor as a function of the env observations."""
         self.actor.eval()
 
         @torch.no_grad()
         def policy(obs: dict) -> torch.Tensor:
-            return self.actor(actor_obs(obs["proprio"], obs["goal"]))
+            return self.actor(obs["actor"])
 
         return policy
 
     def _optimizers(self) -> dict[str, list[torch.optim.Optimizer]]:
-        """Returns the optimizers of the learners.
-
-        Returns:
-            The world model, actor and critic optimizers, keyed by network.
-        """
+        """Returns the world model, actor and critic optimizers, keyed by network."""
         return {
             "world_model": self.wm_learner.optimizers,
             "actor": self.policy_learner.actor_optimizers,
@@ -339,41 +308,13 @@ class Runner:
         }
 
     def _metadata(self) -> dict[str, list[str]]:
-        """Returns the env layout that the network inputs and outputs depend on.
-
-        Returns:
-            The joint, action target, tracked body and sim context spec names, in
-            column order.
-        """
-        manager = self.env.action_manager
-        action_term = manager.get_term(manager.active_terms[0])
+        """Returns the joint, action, body and sim context names of the networks."""
         return {
-            "joint_names": list(self.command.robot.joint_names),
-            "action_names": list(action_term.target_names),
-            "body_names": list(self.command.cfg.body_names),
+            "joint_names": list(self.env.robot.joint_names),
+            "action_names": list(self.env.action_term.target_names),
+            "body_names": list(self.env.cfg.body_names),
             "sim_context": [spec.name for spec in self.sim_context.specs],
         }
-
-    def _track_episodes(
-        self, reward: torch.Tensor, done: torch.Tensor, extras: dict
-    ) -> None:
-        """Accumulates the returns and lengths of the episodes that end on the device.
-
-        Args:
-            reward: Rewards of the step, shape (num_envs,).
-            done: Whether the env reset after the step, shape (num_envs,).
-            extras: Extras returned by the env step.
-        """
-        if extras.get("log"):
-            self._episode_logs.append(extras["log"])
-        self._episode_return += reward
-        self._episode_length += 1
-        ended = done.float()
-        self._finished_return += (self._episode_return * ended).sum()
-        self._finished_length += (self._episode_length * ended).sum()
-        self._finished_count += ended.sum()
-        self._episode_return *= 1.0 - ended
-        self._episode_length *= 1.0 - ended
 
     def _log(
         self,
@@ -395,20 +336,7 @@ class Runner:
             timer: Seconds spent per phase since the last log.
         """
         scalars = {name: float(value) for name, value in losses.items()}
-        count = float(self._finished_count)
-        if count > 0:
-            scalars["Episode/return"] = float(self._finished_return) / count
-            scalars["Episode/length"] = float(self._finished_length) / count
-        for total in (
-            self._finished_return,
-            self._finished_length,
-            self._finished_count,
-        ):
-            total.zero_()
-        for key in dict.fromkeys(k for log in self._episode_logs for k in log):
-            values = [float(log[key]) for log in self._episode_logs if key in log]
-            scalars[key] = sum(values) / len(values)
-        self._episode_logs.clear()
+        scalars |= self.env.pop_log()
         interval_time = sum(timer.values())
         scalars["Perf/steps_per_second"] = (
             self.cfg.log_interval * self.env.num_envs / interval_time
@@ -433,11 +361,7 @@ class Runner:
         print("\n".join(lines))
 
     def _now(self) -> float:
-        """Returns the wall time after the pending device work finishes.
-
-        Returns:
-            Seconds since an arbitrary point.
-        """
+        """Returns the wall time in seconds after the pending device work finishes."""
         if torch.device(self.device).type == "cuda":
             torch.cuda.synchronize(self.device)
         return time.perf_counter()

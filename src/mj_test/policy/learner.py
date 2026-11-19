@@ -9,8 +9,8 @@ import torch
 from tensordict import TensorDict
 from torch import nn
 
+from mj_test.envs.imagination_env import ImaginationEnv
 from mj_test.utils.optim import CapturedUpdate, build_optimizers, optimize_step
-from mj_test.wm.imagination import ImaginationEnv
 
 
 @dataclass
@@ -97,14 +97,7 @@ def actor_objective(
 
 
 class ActorCriticPolicyLearner:
-    """Trains the actor on imagined returns and fits the critic with GAE.
-
-    Args:
-        actor: Maps actor observations to raw actions.
-        critic: Maps critic observations to values of shape (..., 1).
-        imagination: The imagination env.
-        cfg: Learner hyperparameters.
-    """
+    """Trains the actor on imagined returns and fits the critic with GAE."""
 
     def __init__(
         self,
@@ -144,14 +137,7 @@ class ActorCriticPolicyLearner:
         return {f"Policy/{name}": torch.stack(v).mean() for name, v in logs.items()}
 
     def _update_batch(self, start: TensorDict) -> dict[str, torch.Tensor]:
-        """Takes one actor step on an imagined rollout, then fits the critic to it.
-
-        Args:
-            start: Rollout starts of batch size (B,).
-
-        Returns:
-            The statistics of the batch.
-        """
+        """Takes one actor step on an imagined rollout, then fits the critic to it."""
         cfg = self.cfg
         self.critic.requires_grad_(False)
         steps, last_obs = self._rollout(start)
@@ -178,35 +164,23 @@ class ActorCriticPolicyLearner:
     def _rollout(self, start: TensorDict) -> tuple[TensorDict, TensorDict]:
         """Rolls the actor out in the imagination for ``horizon`` steps.
 
-        Args:
-            start: Rollout starts of batch size (B,).
-
         Returns:
             The steps of batch size (horizon, B), holding the ``critic`` observations
             before each step, the ``reward`` and the termination probability
             ``done``, and the observations after the last step.
         """
-        obs = self.imagination.reset(start, self.cfg.horizon)
+        obs = self.imagination.reset(start)
         steps = []
         for _ in range(self.cfg.horizon):
             action = self.actor(obs["actor"])
-            next_obs, reward, term_prob, _ = self.imagination.step(action)
+            next_obs, reward, term_prob, _, _ = self.imagination.step(action)
             step = {"critic": obs["critic"], "reward": reward, "done": term_prob}
             steps.append(TensorDict(step, batch_size=reward.shape))
             obs = next_obs
         return torch.stack(steps), obs
 
     def _fit_critic(self, steps: TensorDict, last_obs: TensorDict) -> torch.Tensor:
-        """Fits the critic to the GAE returns of a detached rollout.
-
-        Args:
-            steps: Rollout of batch size (T, B) with ``critic``, ``reward`` and
-                ``done``.
-            last_obs: Observations after the last step.
-
-        Returns:
-            The mean value loss.
-        """
+        """Fits the critic to the GAE returns of a detached rollout."""
         cfg = self.cfg
         with torch.no_grad():
             values = self.critic(steps["critic"])

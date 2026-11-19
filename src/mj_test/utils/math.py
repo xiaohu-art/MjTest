@@ -5,14 +5,7 @@ from mjlab.utils.lab_api.math import quat_apply_inverse, quat_mul
 
 
 def projected_gravity(quat: torch.Tensor) -> torch.Tensor:
-    """Expresses the world down direction in the frames of the quaternions.
-
-    Args:
-        quat: wxyz quaternions of shape (..., 4).
-
-    Returns:
-        Unit down vectors of shape (..., 3).
-    """
+    """Expresses the world down direction in the frames of wxyz quaternions."""
     down_w = torch.zeros_like(quat[..., :3])
     down_w[..., 2] = -1.0
     return quat_apply_inverse(quat, down_w)

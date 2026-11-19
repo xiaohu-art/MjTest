@@ -21,16 +21,7 @@ class FieldSpec:
     dtype: torch.dtype = torch.float32
 
     def shape(self, num_envs: int, buffer_size: int) -> tuple[int, ...]:
-        """Returns the storage shape of the field.
-
-        Args:
-            num_envs: Number of envs.
-            buffer_size: Number of transitions kept per env.
-
-        Returns:
-            ``(num_envs, buffer_size)`` for a scalar field, otherwise with
-            ``dim`` appended.
-        """
+        """Returns the storage shape ``(num_envs, buffer_size[, dim])`` of the field."""
         if self.dim:
             return (num_envs, buffer_size, self.dim)
         return (num_envs, buffer_size)
@@ -72,12 +63,7 @@ class ReplayBuffer:
         )
 
     def insert(self, td: TensorDict) -> None:
-        """Writes one transition of every env, overwriting the oldest when full.
-
-        Args:
-            td: One transition per env, with batch size (num_envs,) and exactly
-                the schema's fields.
-        """
+        """Writes one transition of every env, overwriting the oldest when full."""
         if td.batch_size != torch.Size([self.num_envs]):
             raise ValueError(
                 f"insert expects batch_size=[{self.num_envs}], got {list(td.batch_size)}."

@@ -9,11 +9,11 @@ from typing import cast
 
 import mjlab
 import tyro
-from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.utils.os import get_checkpoint_path
 from mjlab.utils.torch import configure_torch_backends
 
+from mj_test.envs.sim_env import SimEnv, SimEnvCfg
 from mj_test.runner.runner import Runner, RunnerCfg
 
 
@@ -32,7 +32,7 @@ class TrainConfig:
         load_checkpoint: Regex of the checkpoint file in that run directory.
     """
 
-    env: ManagerBasedRlEnvCfg
+    env: SimEnvCfg
     runner: RunnerCfg
     num_envs: int = 4096
     device: str = "cuda:0"
@@ -53,7 +53,8 @@ def main() -> None:
         TrainConfig,
         args=remaining_args,
         default=TrainConfig(
-            env=load_env_cfg(task_id), runner=cast(RunnerCfg, load_rl_cfg(task_id))
+            env=cast(SimEnvCfg, load_env_cfg(task_id)),
+            runner=cast(RunnerCfg, load_rl_cfg(task_id)),
         ),
         config=mjlab.TYRO_FLAGS,
     )
@@ -66,7 +67,7 @@ def main() -> None:
     )
     cfg.env.scene.num_envs = cfg.num_envs
     cfg.env.seed = cfg.runner.seed
-    env = ManagerBasedRlEnv(cfg=cfg.env, device=cfg.device)
+    env = SimEnv(cfg.env, device=cfg.device)
     log_dir = log_root / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Logging to {log_dir}")

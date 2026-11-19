@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 import torch
 from tensordict import TensorDict
 
-from mj_test.mdp.commands import RobotState
+from mj_test.mdp.motion import RobotState
 from mj_test.utils.optim import CapturedUpdate, build_optimizers, optimize_step
 from mj_test.wm.dynamics import Dynamics
 from mj_test.wm.representation import local_state, loss_blocks
@@ -44,12 +44,7 @@ class WorldModelLearnerCfg:
 
 
 class WorldModelLearner:
-    """Fits the dynamics to real windows with an autoregressive rollout loss.
-
-    Args:
-        dynamics: The dynamics model to train.
-        cfg: Learner hyperparameters.
-    """
+    """Fits the dynamics to real windows with an autoregressive rollout loss."""
 
     def __init__(self, dynamics: Dynamics, cfg: WorldModelLearnerCfg) -> None:
         self.dynamics = dynamics
@@ -60,12 +55,7 @@ class WorldModelLearner:
         self._step = CapturedUpdate(self._update_batch)
 
     def update_normalization(self, states: RobotState, actions: torch.Tensor) -> None:
-        """Updates the dynamics normalizers with freshly collected data.
-
-        Args:
-            states: Collected robot states with any leading shape.
-            actions: Raw actions with the same leading shape, (..., action_dim).
-        """
+        """Updates the dynamics normalizers with collected states and raw actions."""
         x = local_state(states)
         a = self.dynamics.joint_pos_target(actions)
         normalizers = (self.dynamics.state_normalizer, self.dynamics.action_normalizer)
@@ -97,14 +87,7 @@ class WorldModelLearner:
         return {f"WorldModel/{name}": torch.stack(v).mean() for name, v in logs.items()}
 
     def _update_batch(self, td: TensorDict) -> dict[str, torch.Tensor]:
-        """Runs one gradient step on one batch of windows.
-
-        Args:
-            td: Windows of batch size (batch_size, horizon).
-
-        Returns:
-            Total loss under ``loss`` and the MSE of each loss block.
-        """
+        """Runs one gradient step on one batch of windows."""
         names = [field.name for field in RobotState.fields()]
         states = RobotState.from_tensordict(td.select(*names))
         pred = self._rollout(states, td["action"], td["sim_ctx"][:, 0])
@@ -138,15 +121,7 @@ class WorldModelLearner:
     def _losses(
         self, pred: RobotState, target: RobotState
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Computes the Bryson-weighted loss over the loss blocks.
-
-        Args:
-            pred: Predicted states.
-            target: Real states of the same shape.
-
-        Returns:
-            The total loss, and the per-element MSE of each loss block.
-        """
+        """Computes the Bryson-weighted loss and the MSE of each loss block."""
         pred_blocks = loss_blocks(pred)
         target_blocks = loss_blocks(target)
         loss = 0.0

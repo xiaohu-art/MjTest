@@ -24,7 +24,7 @@ class ReturnSampler:
 
     Args:
         cfg: Sampler hyperparameters.
-        bin_count: Number of bins of the motion command.
+        bin_count: Number of reset sampling bins.
         num_envs: Number of envs.
         max_step_reward: Largest reward of one env step.
         device: Device of the buffers.
@@ -97,37 +97,21 @@ class ReturnSampler:
         return self._distribution()
 
     def state_dict(self) -> dict[str, torch.Tensor]:
-        """Returns the bin statistics.
-
-        Returns:
-            The ``value``, ``count`` and ``effort`` of every bin.
-        """
+        """Returns the ``value``, ``count`` and ``effort`` of every bin."""
         return {"value": self.value, "count": self.count, "effort": self.effort}
 
     def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
-        """Restores the bin statistics in place.
-
-        Args:
-            state: Bin statistics as returned by ``state_dict``.
-        """
+        """Restores the bin statistics in place."""
         self.value.copy_(state["value"])
         self.count.copy_(state["count"])
         self.effort.copy_(state["effort"])
 
     def _dones(self) -> torch.Tensor:
-        """Returns whether each buffered step ended its episode.
-
-        Returns:
-            Episode end flags of shape (num_envs, horizon).
-        """
+        """Returns the episode end flags of shape (num_envs, horizon)."""
         return self._terminated | self._clip_end | self._timed_out
 
     def _returns(self) -> torch.Tensor:
-        """Computes the discounted return of every buffered step.
-
-        Returns:
-            Returns of shape (num_envs, horizon).
-        """
+        """Computes the discounted return of each buffered step."""
         gamma = self.cfg.gamma
         rewards = self._rewards
         next_value = torch.where(
@@ -169,11 +153,7 @@ class ReturnSampler:
         )
 
     def _distribution(self) -> torch.Tensor:
-        """Computes the reset distribution from the bin values.
-
-        Returns:
-            Reset probabilities of shape (bin_count,).
-        """
+        """Computes the reset distribution over the bins from the bin values."""
         cfg = self.cfg
         focus = torch.softmax(-cfg.steepness * self.value / self.v_max, dim=0)
         self.effort += focus.double().square()

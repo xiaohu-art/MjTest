@@ -5,20 +5,18 @@ from dataclasses import dataclass
 
 import mujoco_warp as mjwarp
 from mjlab.asset_zoo.robots import G1_ACTION_SCALE, get_g1_robot_cfg
-from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
-from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
-from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.scene import SceneCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from mj_test import mdp
+from mj_test.envs.env import RewardTerm, TerminationTerm
+from mj_test.envs.sim_env import SimEnvCfg
 
 
 @dataclass(kw_only=True)
@@ -26,11 +24,7 @@ class QuietSimulationCfg(SimulationCfg):
     """Simulation config that silences the solver iteration overflow warnings."""
 
     def apply_wp_opt(self, wp_opt: mjwarp.Option) -> None:
-        """Applies the options and clears the iteration overflow warning flags.
-
-        Args:
-            wp_opt: The MuJoCo Warp options to modify in place.
-        """
+        """Applies the options and clears the iteration overflow warning flags."""
         super().apply_wp_opt(wp_opt)
         wp_opt.warn_overflow &= ~int(
             mjwarp.OverflowType.ITERATIONS | mjwarp.OverflowType.LS_ITERATIONS
@@ -49,170 +43,48 @@ VELOCITY_RANGE = {
 }
 
 
-def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+def make_env_cfg(play: bool = False) -> SimEnvCfg:
     """Builds the env configuration.
 
     Args:
-        play: Whether to build the playback variant, with near-infinite episodes
-            and no reset randomization of the root pose and velocity.
-
-    Returns:
-        The env configuration.
+        play: Whether to build the playback variant, with near-infinite episodes,
+            no observation noise and no reset randomization of the root pose and
+            velocity.
     """
-    motion = mdp.MotionCommandCfg(
-        entity_name="robot",
-        resampling_time_range=(1.0e9, 1.0e9),
-        debug_vis=True,
-        pose_range={
-            "x": (-0.05, 0.05),
-            "y": (-0.05, 0.05),
-            "z": (-0.01, 0.01),
-            "roll": (-0.1, 0.1),
-            "pitch": (-0.1, 0.1),
-            "yaw": (-0.2, 0.2),
-        },
-        velocity_range=VELOCITY_RANGE,
-        joint_position_range=(-0.1, 0.1),
-        motion_file=MOTION_FILE,
-        anchor_body_name="pelvis",
-        body_names=(
-            "pelvis",
-            "left_hip_roll_link",
-            "left_knee_link",
-            "left_ankle_roll_link",
-            "right_hip_roll_link",
-            "right_knee_link",
-            "right_ankle_roll_link",
-            "torso_link",
-            "left_shoulder_roll_link",
-            "left_elbow_link",
-            "left_wrist_yaw_link",
-            "right_shoulder_roll_link",
-            "right_elbow_link",
-            "right_wrist_yaw_link",
-        ),
-    )
-
-    ##
-    # Observations
-    ##
-
-    proprio_terms = {
-        "projected_gravity": ObservationTermCfg(
-            func=mdp.projected_gravity,
-            noise=Unoise(n_min=-0.05, n_max=0.05),
-        ),
-        "base_ang_vel": ObservationTermCfg(
-            func=mdp.builtin_sensor,
-            params={"sensor_name": "robot/imu_ang_vel"},
-            noise=Unoise(n_min=-0.2, n_max=0.2),
-        ),
-        "joint_pos": ObservationTermCfg(
-            func=mdp.joint_pos_rel,
-            params={"biased": True},
-            noise=Unoise(n_min=-0.01, n_max=0.01),
-        ),
-        "joint_vel": ObservationTermCfg(
-            func=mdp.joint_vel_rel,
-            noise=Unoise(n_min=-0.5, n_max=0.5),
-        ),
-        "actions": ObservationTermCfg(func=mdp.last_action),
-    }
-
-    state_terms = {
-        "root_pos": ObservationTermCfg(func=mdp.root_pos),
-        "root_quat": ObservationTermCfg(func=mdp.root_quat),
-        "joint_pos": ObservationTermCfg(func=mdp.joint_pos),
-        "root_lin_vel": ObservationTermCfg(func=mdp.root_lin_vel),
-        "root_ang_vel": ObservationTermCfg(func=mdp.root_ang_vel),
-        "joint_vel": ObservationTermCfg(func=mdp.joint_vel),
-    }
-
-    goal_terms = {
-        "goal": ObservationTermCfg(
-            func=mdp.motion_goal, params={"command_name": "motion"}
-        ),
-    }
-
-    observations = {
-        "proprio": ObservationGroupCfg(
-            terms=proprio_terms,
-            concatenate_terms=True,
-            enable_corruption=True,
-        ),
-        "state": ObservationGroupCfg(
-            terms=state_terms,
-            concatenate_terms=False,
-            enable_corruption=False,
-        ),
-        "goal": ObservationGroupCfg(
-            terms=goal_terms, concatenate_terms=True, enable_corruption=False
-        ),
-    }
-
-    ##
-    # Actions
-    ##
-
-    actions = {
-        "joint_pos": JointPositionActionCfg(
-            entity_name="robot",
-            actuator_names=(".*",),
-            scale=G1_ACTION_SCALE,
-            use_default_offset=True,
-        )
-    }
-
-    ##
-    # Rewards
-    ##
-
     rewards = {
-        "motion_global_root_pos": RewardTermCfg(
-            func=mdp.transition_reward,
-            weight=0.5,
-            params={"term": mdp.global_anchor_position_error_exp, "std": 0.3},
+        "motion_global_root_pos": RewardTerm(
+            mdp.global_anchor_position_error_exp, 0.5, {"std": 0.3}
         ),
-        "motion_global_root_ori": RewardTermCfg(
-            func=mdp.transition_reward,
-            weight=0.5,
-            params={"term": mdp.global_anchor_orientation_error_exp, "std": 0.4},
+        "motion_global_root_ori": RewardTerm(
+            mdp.global_anchor_orientation_error_exp, 0.5, {"std": 0.4}
         ),
-        "motion_body_pos": RewardTermCfg(
-            func=mdp.transition_reward,
-            weight=1.0,
-            params={"term": mdp.relative_body_position_error_exp, "std": 0.3},
+        "motion_body_pos": RewardTerm(
+            mdp.relative_body_position_error_exp, 1.0, {"std": 0.3}
         ),
-        "motion_body_ori": RewardTermCfg(
-            func=mdp.transition_reward,
-            weight=1.0,
-            params={"term": mdp.relative_body_orientation_error_exp, "std": 0.4},
+        "motion_body_ori": RewardTerm(
+            mdp.relative_body_orientation_error_exp, 1.0, {"std": 0.4}
         ),
-        "motion_body_lin_vel": RewardTermCfg(
-            func=mdp.transition_reward,
-            weight=1.0,
-            params={"term": mdp.global_body_linear_velocity_error_exp, "std": 1.0},
+        "motion_body_lin_vel": RewardTerm(
+            mdp.global_body_linear_velocity_error_exp, 1.0, {"std": 1.0}
         ),
-        "motion_body_ang_vel": RewardTermCfg(
-            func=mdp.transition_reward,
-            weight=1.0,
-            params={"term": mdp.global_body_angular_velocity_error_exp, "std": 3.14},
+        "motion_body_ang_vel": RewardTerm(
+            mdp.global_body_angular_velocity_error_exp, 1.0, {"std": 3.14}
         ),
-        "action_rate_l2": RewardTermCfg(
-            func=mdp.transition_reward,
-            weight=-1e-1,
-            params={"term": mdp.action_rate},
-        ),
-        "joint_limit": RewardTermCfg(
-            func=mdp.transition_reward,
-            weight=-2.0,
-            params={"term": mdp.joint_limit_violation},
-        ),
+        "action_rate_l2": RewardTerm(mdp.action_rate, -1e-1),
+        "joint_limit": RewardTerm(mdp.joint_limit_violation, -2.0),
     }
 
-    ##
-    # Events
-    ##
+    terminations = {
+        "anchor_pos": TerminationTerm(mdp.anchor_height_error, 0.25),
+        "anchor_ori": TerminationTerm(mdp.anchor_tilt_error, 0.8),
+    }
+
+    proprio_noise = {
+        "projected_gravity": Unoise(n_min=-0.05, n_max=0.05),
+        "base_ang_vel": Unoise(n_min=-0.2, n_max=0.2),
+        "joint_pos": Unoise(n_min=-0.01, n_max=0.01),
+        "joint_vel": Unoise(n_min=-0.5, n_max=0.5),
+    }
 
     events = {
         "base_com": EventTermCfg(
@@ -250,51 +122,62 @@ def make_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         ),
     }
 
-    ##
-    # Terminations
-    ##
-
-    terminations = {
-        "time_out": TerminationTermCfg(func=mdp.time_out, time_out=True),
-        "motion_end": TerminationTermCfg(
-            func=mdp.motion_end, time_out=True, params={"command_name": "motion"}
+    cfg = SimEnvCfg(
+        motion_file=MOTION_FILE,
+        body_names=(
+            "pelvis",
+            "left_hip_roll_link",
+            "left_knee_link",
+            "left_ankle_roll_link",
+            "right_hip_roll_link",
+            "right_knee_link",
+            "right_ankle_roll_link",
+            "torso_link",
+            "left_shoulder_roll_link",
+            "left_elbow_link",
+            "left_wrist_yaw_link",
+            "right_shoulder_roll_link",
+            "right_elbow_link",
+            "right_wrist_yaw_link",
         ),
-        "anchor_pos": TerminationTermCfg(
-            func=mdp.transition_termination,
-            params={"error": mdp.anchor_height_error, "threshold": 0.25},
-        ),
-        "anchor_ori": TerminationTermCfg(
-            func=mdp.transition_termination,
-            params={"error": mdp.anchor_tilt_error, "threshold": 0.8},
-        ),
-    }
-
-    cfg = ManagerBasedRlEnvCfg(
+        rewards=rewards,
+        terminations=terminations,
+        proprio_noise=proprio_noise,
         scene=SceneCfg(
             terrain=TerrainEntityCfg(terrain_type="plane"),
             entities={"robot": get_g1_robot_cfg()},
             num_envs=1,
         ),
-        commands={"motion": motion},
-        observations=observations,
-        actions=actions,
-        events=events,
-        rewards=rewards,
-        terminations=terminations,
-        # sim=SimulationCfg(
         sim=QuietSimulationCfg(
             nconmax=35,
             njmax=250,
             mujoco=MujocoCfg(timestep=0.005, iterations=10, ls_iterations=20),
         ),
+        action=JointPositionActionCfg(
+            entity_name="robot",
+            actuator_names=(".*",),
+            scale=G1_ACTION_SCALE,
+            use_default_offset=True,
+        ),
         decimation=4,
         episode_length_s=10.0,
+        events=events,
+        pose_range={
+            "x": (-0.05, 0.05),
+            "y": (-0.05, 0.05),
+            "z": (-0.01, 0.01),
+            "roll": (-0.1, 0.1),
+            "pitch": (-0.1, 0.1),
+            "yaw": (-0.2, 0.2),
+        },
+        velocity_range=VELOCITY_RANGE,
+        joint_position_range=(-0.1, 0.1),
     )
 
     if play:
         cfg.episode_length_s = int(1e9)
-        cfg.observations["proprio"].enable_corruption = False
-        motion.pose_range = {}
-        motion.velocity_range = {}
+        cfg.proprio_noise = {}
+        cfg.pose_range = {}
+        cfg.velocity_range = {}
 
     return cfg

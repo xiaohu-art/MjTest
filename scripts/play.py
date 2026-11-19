@@ -11,15 +11,15 @@ import mjlab
 import torch
 import tyro
 import yaml
-from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.utils.os import get_checkpoint_path
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 
-from mj_test.mdp.commands import MotionCommand
+from mj_test.envs.sim_env import SimEnv, SimEnvCfg
 from mj_test.policy.networks import ActorCfg, CriticCfg
 from mj_test.runner.runner import Runner, RunnerCfg
+from mj_test.viewer import ViewerEnv
 from mj_test.wm.dynamics import DynamicsCfg
 
 
@@ -38,7 +38,7 @@ class PlayConfig:
         viewer: Viewer backend. ``auto`` picks native with a display, else viser.
     """
 
-    env: ManagerBasedRlEnvCfg
+    env: SimEnvCfg
     load_run: str = ".*"
     load_checkpoint: str = r"model\.pt"
     num_envs: int = 16
@@ -58,7 +58,7 @@ def main() -> None:
     cfg = tyro.cli(
         PlayConfig,
         args=remaining_args,
-        default=PlayConfig(env=load_env_cfg(task_id, play=True)),
+        default=PlayConfig(env=cast(SimEnvCfg, load_env_cfg(task_id, play=True))),
         config=mjlab.TYRO_FLAGS,
     )
     configure_torch_backends()
@@ -73,26 +73,26 @@ def main() -> None:
     print(f"[INFO] Loading {checkpoint}")
 
     cfg.env.scene.num_envs = cfg.num_envs
-    env = ManagerBasedRlEnv(cfg=cfg.env, device=cfg.device)
+    env = SimEnv(cfg.env, device=cfg.device)
     runner = (load_runner_cls(task_id) or Runner)(env, runner_cfg)
     runner.load(checkpoint, networks_only=True)
     policy = runner.get_inference_policy()
 
     if cfg.from_start:
-        command = cast(MotionCommand, env.command_manager.get_term("motion"))
-        probs = torch.zeros(command.bin_count, device=env.device)
+        probs = torch.zeros(env.bin_count, device=env.device)
         probs[0] = 1.0
-        command.set_sampling_distribution(probs)
+        env.set_sampling_distribution(probs)
         env.reset()
 
     viewer = cfg.viewer
     if viewer == "auto":
         has_display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
         viewer = "native" if has_display else "viser"
+    viewer_env = ViewerEnv(env)
     if viewer == "native":
-        NativeMujocoViewer(env, policy).run()
+        NativeMujocoViewer(viewer_env, policy).run()
     else:
-        ViserPlayViewer(env, policy).run()
+        ViserPlayViewer(viewer_env, policy).run()
     env.close()
 
 
