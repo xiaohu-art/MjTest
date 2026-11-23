@@ -1,105 +1,119 @@
-"""Motion tracking env shared by the simulator and the imagination."""
+"""Base env."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
-from mjlab.utils.noise import NoiseCfg
+from mjlab.utils.noise import NoiseCfg, UniformNoiseCfg
+from omegaconf import DictConfig
 from tensordict import TensorDict
 
-from mj_test.mdp.motion import BodyState, MotionLoader, RobotState
-from mj_test.mdp.observations import goal_window
-from mj_test.wm.representation import actor_obs, critic_obs, proprio
+from mj_test import mdp
+
+if TYPE_CHECKING:
+    from mjlab.entity import EntityData
+
+    from mj_test.envs.imagination_env import ImaginedEntityData
+    from mj_test.mdp.action import JointPositionAction
 
 
 @dataclass
 class RewardTerm:
-    """One weighted reward term.
-
-    Attributes:
-        func: Reward of the env's current step, ``func(env, **params)`` of shape
-            (B,).
-        weight: Weight of the term.
-        params: Remaining keyword arguments of ``func``.
-    """
-
     func: Callable[..., torch.Tensor]
     weight: float
     params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
+class ObservationTerm:
+    func: Callable[..., torch.Tensor]
+    params: dict[str, Any] = field(default_factory=dict)
+    noise: NoiseCfg | None = None
+
+
+@dataclass
 class TerminationTerm:
-    """One termination condition.
-
-    Attributes:
-        error: Error of the env's current step, ``error(env)`` of shape (B,).
-        threshold: Largest allowed error.
-    """
-
-    error: Callable[..., torch.Tensor]
-    threshold: float
+    func: Callable[..., torch.Tensor]
+    params: dict[str, Any] = field(default_factory=dict)
+    threshold: float | None = None
+    time_out: bool = False
 
 
-@dataclass(kw_only=True)
-class EnvCfg:
-    """Configuration of the tracking MDP, shared by the simulator and the imagination.
+def observation_group(cfg: DictConfig) -> dict[str, ObservationTerm]:
+    noisy = cfg.get("enable_noise", False)
+    terms = {}
+    for name, term in cfg.terms.items():
+        noise = term.get("noise") if noisy else None
+        terms[name] = ObservationTerm(
+            getattr(mdp, term.func),
+            dict(term.get("params", {})),
+            None if noise is None else UniformNoiseCfg(n_min=noise[0], n_max=noise[1]),
+        )
+    return terms
 
-    Attributes:
-        motion_file: Path of one reference clip, or paths of several clips.
-        body_names: Tracked bodies, anchor first.
-        rewards: Reward terms, keyed by name.
-        terminations: Termination conditions, keyed by name.
-        proprio_noise: Noise of the proprioceptive terms, keyed by the term names of
-            ``representation.proprio``.
-    """
 
-    motion_file: str | list[str]
-    body_names: tuple[str, ...]
-    rewards: dict[str, RewardTerm]
-    terminations: dict[str, TerminationTerm]
-    proprio_noise: dict[str, NoiseCfg] = field(default_factory=dict)
+def termination_term(name: str, cfg: DictConfig) -> TerminationTerm:
+    time_out = bool(cfg.get("time_out", False))
+    threshold = cfg.get("threshold")
+    if time_out == (threshold is not None):
+        raise ValueError(
+            f"Termination '{name}' needs either a threshold or time_out: true."
+        )
+    return TerminationTerm(
+        getattr(mdp, cfg.func),
+        dict(cfg.get("params", {})),
+        None if threshold is None else float(threshold),
+        time_out,
+    )
+
+
+class Command(Protocol):
+    def reset(self, env_ids: torch.Tensor) -> None: ...
+
+    def update_command(self) -> None: ...
+
+    def like(self, env: Env) -> Command: ...
+
+    def log(self) -> dict[str, float]: ...
+
+    def state_dict(self) -> dict[str, Any]: ...
+
+    def load_state_dict(self, state: dict[str, Any]) -> None: ...
+
+    def metrics(self) -> dict[str, torch.Tensor]: ...
 
 
 class Env(ABC):
-    """Motion tracking env whose robot state advances by a simulator or a world model.
+    robot: EntityData | ImaginedEntityData
+    sim_ctx: torch.Tensor  # Normalized sim context, (B, C).
+    env_origins: torch.Tensor  # (B, 3).
+    command: Command
+    action_term: JointPositionAction
+    num_envs: int
 
-    Args:
-        cfg: MDP configuration.
-        motion: Reference motion.
-        dt: Env step duration in seconds.
-        default_joint_pos: Default joint positions, shape (J,).
-        joint_limits: Lower and upper soft joint position limits, shape (J, 2).
-    """
-
-    robot_state: RobotState
-    frames: torch.Tensor
-    action: torch.Tensor
-    prev_action: torch.Tensor
-    sim_ctx: torch.Tensor
-    encoder_bias: torch.Tensor
-    robot_bodies: BodyState
-    ref_bodies: BodyState
-
-    def __init__(
-        self,
-        cfg: EnvCfg,
-        motion: MotionLoader,
-        dt: float,
-        default_joint_pos: torch.Tensor,
-        joint_limits: torch.Tensor,
-    ) -> None:
+    def __init__(self, cfg: DictConfig, dt: float) -> None:
         self.cfg = cfg
-        self.motion = motion
         self.dt = dt
-        self.default_joint_pos = default_joint_pos
-        self.joint_limits = joint_limits
+        self.rewards = {
+            name: RewardTerm(
+                getattr(mdp, term.func), term.weight, dict(term.get("params", {}))
+            )
+            for name, term in cfg.rewards.items()
+        }
+        self.terminations = {
+            name: termination_term(name, term)
+            for name, term in cfg.terminations.items()
+        }
+        self.observation_groups = {
+            group: observation_group(group_cfg)
+            for group, group_cfg in cfg.observations.items()
+        }
         self.max_step_reward = dt * sum(
-            term.weight for term in cfg.rewards.values() if term.weight > 0.0
+            term.weight for term in self.rewards.values() if term.weight > 0.0
         )
 
     @abstractmethod
@@ -112,66 +126,47 @@ class Env(ABC):
             action: Raw actions of shape (B, A).
         """
 
-    def goal(self) -> torch.Tensor:
-        """Computes the goal of the current state.
-
-        Returns:
-            The goal window of shape (B, goal_dim).
-        """
-        return goal_window(
-            self.motion,
-            self.frames,
-            self.robot_state.root_pos,
-            self.robot_state.root_quat,
-        )
-
     @torch.compile
     def observations(self) -> TensorDict:
-        """Builds the observations of the current state.
-
-        Returns:
-            The noisy ``actor`` observations ``[proprio, goal]`` and the ``critic``
-            observations, of batch size (B,).
         """
-        terms = proprio(
-            self.robot_state, self.action, self.encoder_bias, self.default_joint_pos
-        )
-        for name, noise in self.cfg.proprio_noise.items():
-            terms[name] = noise.apply(terms[name])
-        goal = self.goal()
-        return TensorDict(
-            {
-                "actor": actor_obs(torch.cat(list(terms.values()), dim=-1), goal),
-                "critic": critic_obs(self.robot_state, goal, self.sim_ctx),
-            },
-            batch_size=self.frames.shape,
-        )
+        Each observation group concatenated in order.
+        Batch size (B,).
+        """
+        groups = {}
+        for group, terms in self.observation_groups.items():
+            values = []
+            for term in terms.values():
+                value = term.func(self, **term.params)
+                values.append(value if term.noise is None else term.noise.apply(value))
+            groups[group] = torch.cat(values, dim=-1)
+        return TensorDict(groups, batch_size=[self.num_envs])
 
     @torch.compile
-    def _update(
-        self, next_state: RobotState, action: torch.Tensor
+    def _post_step(
+        self,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        """Records the step to ``next_state`` under ``action`` and evaluates it.
+        """Evaluates the reward terms and the error terms of the terminations."""
+        terms = {}
+        reward = self.env_origins.new_zeros(self.num_envs)
+        for name, term in self.rewards.items():
+            value = term.func(self, **term.params)
+            terms[name] = value
+            weighted = value * term.weight * self.dt
+            reward = reward + torch.nan_to_num(
+                weighted, nan=0.0, posinf=0.0, neginf=0.0
+            )
 
-        Args:
-            next_state: Robot state after the step.
-            action: Raw actions of the step, shape (B, A).
-        """
-        self.prev_action, self.action = self.action, action
-        self.robot_state = next_state
-        self.robot_bodies = self.motion.body_state(next_state)
-        self.ref_bodies = self.motion.bodies[self.frames]
-        rewards = self.cfg.rewards.items()
-        terms = {name: term.func(self, **term.params) for name, term in rewards}
-        reward = sum(
-            torch.nan_to_num(terms[name] * term.weight * self.dt, 0.0, 0.0, 0.0)
-            for name, term in rewards
-        )
         errors = {
-            name: term.error(self) / term.threshold
-            for name, term in self.cfg.terminations.items()
+            name: term.func(self, **term.params) / term.threshold
+            for name, term in self.terminations.items()
+            if term.threshold is not None
         }
-        self.frames = torch.minimum(
-            self.frames + 1, self.motion.last_frame(self.frames)
-        )
         return reward, terms, errors
+
+    def _time_outs(self) -> dict[str, torch.Tensor]:
+        """Evaluates the time out terms of the terminations, keyed by term name."""
+        return {
+            name: term.func(self, **term.params)
+            for name, term in self.terminations.items()
+            if term.time_out
+        }

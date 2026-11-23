@@ -1,60 +1,71 @@
-"""Goal observation of the motion tracking task."""
-
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
-from mjlab.utils.lab_api.math import matrix_from_quat, subtract_frame_transforms
 
-from .motion import MotionLoader
+if TYPE_CHECKING:
+    from mj_test.envs.env import Env
 
-__all__ = ["NUM_GOAL_FRAMES", "GOAL_FRAME_STRIDE", "goal_window"]
+__all__ = [
+    "base_ang_vel",
+    "joint_pos_rel",
+    "joint_vel_rel",
+    "last_action",
+    "motion_goal",
+    "projected_gravity",
+    "robot_local_state",
+    "sim_ctx",
+]
 
-NUM_GOAL_FRAMES = 10
-GOAL_FRAME_STRIDE = 5
+
+def projected_gravity(env: Env) -> torch.Tensor:
+    """Gravity direction in the root frame, shape (B, 3)."""
+    return env.robot.projected_gravity_b
 
 
-def goal_window_indices(motion: MotionLoader, frames: torch.Tensor) -> torch.Tensor:
-    """Computes the goal window frames, strided and clamped to the end of each clip."""
-    offsets = torch.arange(NUM_GOAL_FRAMES, device=frames.device) * GOAL_FRAME_STRIDE
-    return torch.minimum(frames[:, None] + offsets, motion.last_frame(frames)[:, None])
+def base_ang_vel(env: Env) -> torch.Tensor:
+    """Root angular velocity in the root frame, shape (B, 3)."""
+    return env.robot.root_link_ang_vel_b
 
 
-def goal_window(
-    motion: MotionLoader,
-    frames: torch.Tensor,
-    root_pos: torch.Tensor,
-    root_quat: torch.Tensor,
-) -> torch.Tensor:
-    """Computes the goal over the strided window of reference frames.
+def joint_pos_rel(env: Env) -> torch.Tensor:
+    """Joint positions as the encoders read them, relative to the default, (B, J)."""
+    robot = env.robot
+    return robot.joint_pos_biased - robot.default_joint_pos
 
-    Args:
-        motion: The reference motion.
-        frames: Current frame of each env, shape (num_envs,).
-        root_pos: Robot root positions of shape (num_envs, 3), without env origins.
-        root_quat: Robot root wxyz quaternions of shape (num_envs, 4).
 
-    Returns:
-        Three blocks, each flattened over the window frames: the per-frame
-        ``[joint_pos, joint_vel]``, the relative root positions, and the first two
-        rotation matrix columns of the relative root orientations. The shape is
-        (num_envs, NUM_GOAL_FRAMES * (2 * num_joints + 9)).
-    """
-    idx = goal_window_indices(motion, frames)
-    num_envs, num_frames = idx.shape
-    ref = motion.states[idx]
-    joints = torch.cat([ref.joint_pos, ref.joint_vel], dim=-1)
-    rel_pos, rel_quat = subtract_frame_transforms(
-        root_pos[:, None].expand(-1, num_frames, -1).reshape(-1, 3),
-        root_quat[:, None].expand(-1, num_frames, -1).reshape(-1, 4),
-        ref.root_pos.reshape(-1, 3),
-        ref.root_quat.reshape(-1, 4),
-    )
-    rel_ori = matrix_from_quat(rel_quat)[..., :2]
+def joint_vel_rel(env: Env) -> torch.Tensor:
+    """Joint velocities, shape (B, J)."""
+    return env.robot.joint_vel
+
+
+def last_action(env: Env) -> torch.Tensor:
+    """Raw action of the last step, shape (B, A)."""
+    return env.action_term.action
+
+
+def motion_goal(env: Env) -> torch.Tensor:
+    """Goal window of the motion command, shape (B, goal_dim)."""
+    return env.command.goal()
+
+
+def robot_local_state(env: Env) -> torch.Tensor:
+    robot = env.robot
+    height = robot.root_link_pos_w[:, 2:3] - env.env_origins[:, 2:3]
     return torch.cat(
         [
-            joints.reshape(num_envs, -1),
-            rel_pos.reshape(num_envs, -1),
-            rel_ori.reshape(num_envs, -1),
+            height,
+            robot.projected_gravity_b,
+            robot.root_link_lin_vel_b,
+            robot.root_link_ang_vel_b,
+            robot.joint_pos,
+            robot.joint_vel,
         ],
         dim=-1,
     )
+
+
+def sim_ctx(env: Env) -> torch.Tensor:
+    """Normalized sim context, shape (B, C)."""
+    return env.sim_ctx

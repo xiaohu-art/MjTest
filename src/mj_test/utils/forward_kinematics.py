@@ -1,35 +1,67 @@
-"""Forward kinematics: world-frame pose and velocity of a floating-base robot's
-bodies from its root and joint state, differentiable, in the convention of mjlab's
-``body_link_pose_w`` and ``body_link_vel_w``.
-
-Each body follows MuJoCo's kinematics: the parent frame, then the body's fixed
-offset, then each of its hinges, turning ``qpos - qpos0`` about the hinge axis
-through the hinge anchor. Every hinge, and every body without one, is a step.
-Each returned body composes the steps on its path from the root, root first, and
-sums their hinge twists, taken at the root origin; the root pose and twist apply
-last. The pass runs on per-component ``(..., R)`` tensors, which a compiler fuses
-into few kernels.
-"""
-
 from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import mujoco
 import numpy as np
 import torch
+from mjlab.utils.lab_api.math import quat_apply
+from tensordict import tensorclass
+
+if TYPE_CHECKING:
+    from mjlab.entity import Entity
 
 Vec = tuple[torch.Tensor, ...]
 
 
+@tensorclass
+class GenCoords:
+    """Generalized coordinates and velocities: the free-joint root and the joints."""
+
+    root_pos: torch.Tensor
+    root_quat: torch.Tensor
+    joint_pos: torch.Tensor
+    root_lin_vel: torch.Tensor
+    root_ang_vel: torch.Tensor
+    joint_vel: torch.Tensor
+
+    @classmethod
+    def from_entity(cls, entity: Entity, env_origins: torch.Tensor) -> GenCoords:
+        """Reads an mjlab entity's coordinates from qpos and qvel, which are
+        current without a ``sim.forward()``.
+
+        Args:
+            entity: The floating-base entity.
+            env_origins: World position of each env's origin, shape (B, 3).
+        """
+        data = entity.data
+        qpos, qvel = data.data.qpos, data.data.qvel
+        root_q = entity.indexing.free_joint_q_adr
+        root_v = entity.indexing.free_joint_v_adr
+        root_quat = qpos[:, root_q[3:7]]
+        return cls(
+            root_pos=qpos[:, root_q[0:3]] - env_origins,
+            root_quat=root_quat,
+            joint_pos=data.joint_pos,
+            root_lin_vel=qvel[:, root_v[0:3]],
+            root_ang_vel=quat_apply(root_quat, qvel[:, root_v[3:6]]),
+            joint_vel=data.joint_vel,
+            batch_size=root_quat.shape[:1],
+        )
+
+
+@tensorclass
+class MaxCoords:
+    """World-frame poses and velocities of K bodies, without env origins."""
+
+    pos: torch.Tensor
+    quat: torch.Tensor
+    lin_vel: torch.Tensor
+    ang_vel: torch.Tensor
+
+
 class ForwardKinematics:
-    """The steps on the paths from the entity's free-joint root to the bodies at
-    ``body_rows``, as constants, and the batched pass along them.
-
-    ``body_ids`` are the robot's global body ids in entity order, the first one the
-    free-joint root, ``joint_q_adr`` the qpos addresses in joint column order,
-    ``body_rows`` the entity slots returned, in output order. ``joint_names`` are the
-    names of the joints at ``joint_q_adr`` in column order, without scene prefixes.
-    """
-
     def __init__(
         self,
         mj_model: mujoco.MjModel,
@@ -183,6 +215,83 @@ class ForwardKinematics:
         state = torch.stack([*pos, *_mul(root, quat), *lin, *ang], dim=-1)
         pos_w, quat_w, lin_vel_w, ang_vel_w = state.split((3, 4, 3, 3), dim=-1)
         return pos_w, quat_w, lin_vel_w, ang_vel_w
+
+
+class KinematicModel:
+    """Forward kinematics of a floating-base robot.
+
+    Args:
+        fk: Forward kinematics pass whose output bodies are ``body_names``.
+        body_names: Output bodies.
+        default_joint_pos: Default joint positions, shape (J,).
+        joint_limits: Lower and upper soft joint position limits, shape (J, 2).
+    """
+
+    def __init__(
+        self,
+        fk: ForwardKinematics,
+        body_names: tuple[str, ...],
+        default_joint_pos: torch.Tensor,
+        joint_limits: torch.Tensor,
+    ) -> None:
+        self.fk = fk
+        self.body_names = body_names
+        self.default_joint_pos = default_joint_pos
+        self.joint_limits = joint_limits
+
+    @classmethod
+    def from_entity(
+        cls,
+        mj_model: mujoco.MjModel,
+        entity: Entity,
+        body_names: Sequence[str] | None = None,
+    ) -> KinematicModel:
+        """Builds the forward kinematics of bodies of an mjlab entity.
+
+        Args:
+            mj_model: The compiled model of the scene.
+            entity: The floating-base entity.
+            body_names: Output bodies in order, or None for every body in entity
+                order, as in ``entity.data.body_link_pose_w``.
+        """
+        data = entity.data
+        indexing = entity.indexing
+        if body_names is None:
+            body_names = entity.body_names
+            rows = list(range(len(body_names)))
+        else:
+            rows = entity.find_bodies(tuple(body_names), preserve_order=True)[0]
+        fk = ForwardKinematics(
+            mj_model,
+            indexing.body_ids,
+            indexing.joint_q_adr,
+            torch.tensor(rows, dtype=torch.long),
+            device=data.device,
+        )
+        return cls(
+            fk,
+            tuple(body_names),
+            default_joint_pos=data.default_joint_pos[0].clone(),
+            joint_limits=data.soft_joint_pos_limits[0].clone(),
+        )
+
+    @torch.compile
+    def bodies(self, gen: GenCoords) -> MaxCoords:
+        pos, quat, lin_vel, ang_vel = self.fk(
+            gen.root_pos,
+            gen.root_quat,
+            gen.joint_pos,
+            gen.root_lin_vel,
+            gen.root_ang_vel,
+            gen.joint_vel,
+        )
+        return MaxCoords(
+            pos=pos,
+            quat=quat,
+            lin_vel=lin_vel,
+            ang_vel=ang_vel,
+            batch_size=(*gen.batch_size, len(self.body_names)),
+        )
 
 
 def _add(a: Vec, b: Vec) -> Vec:

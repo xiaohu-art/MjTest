@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Callable, Sequence
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
@@ -26,15 +27,14 @@ class _RewardTerms:
     def __init__(self, env: SimEnv) -> None:
         self.env = env
         self.terms = {
-            name: torch.zeros(env.num_envs, device=env.device)
-            for name in env.cfg.rewards
+            name: torch.zeros(env.num_envs, device=env.device) for name in env.rewards
         }
 
     def get_active_iterable_terms(
         self, env_idx: int
     ) -> Sequence[tuple[str, Sequence[float]]]:
         """Returns ``(name, [value])`` pairs of the weighted reward terms of one env."""
-        rewards = self.env.cfg.rewards
+        rewards = self.env.rewards
         return [
             (name, [float(self.terms[name][env_idx]) * term.weight])
             for name, term in rewards.items()
@@ -77,10 +77,6 @@ class _MotionReference:
         self.mode = mode
         self.ghost_color = np.array(ghost_color, dtype=np.float32)
         self.enabled = True
-        self.body_ids = torch.tensor(
-            env.robot.find_bodies(env.cfg.body_names, preserve_order=True)[0],
-            device=env.device,
-        )
         self._ghost_model = None
         self._scrubber_handles: tuple[Any, ...] = ()
 
@@ -90,29 +86,29 @@ class _MotionReference:
         if not self.enabled or not env_indices:
             return
         env = self.env
-        ref_bodies = env.motion.bodies[env.frames]
-        ref_pos = (ref_bodies.pos + env.scene.env_origins[:, None]).cpu().numpy()
+        cmd = env.command
         if self.mode == "ghost":
             model = self._ghost()
-            indexing = env.robot.indexing
+            indexing = env.entity.indexing
             root_q = indexing.free_joint_q_adr.cpu().numpy()
             joint_q = indexing.joint_q_adr.cpu().numpy()
-            ref_quat = ref_bodies.quat[:, 0].cpu().numpy()
-            ref_joint_pos = env.motion.states.joint_pos[env.frames].cpu().numpy()
+            ref = cmd.motion.gen[cmd.time_steps]
+            root_pos = (ref.root_pos + env.env_origins).cpu().numpy()
+            root_quat = ref.root_quat.cpu().numpy()
+            joint_pos = ref.joint_pos.cpu().numpy()
             for i in env_indices:
                 qpos = np.zeros(env.sim.mj_model.nq)
-                qpos[root_q[0:3]] = ref_pos[i, 0]
-                qpos[root_q[3:7]] = ref_quat[i]
-                qpos[joint_q] = ref_joint_pos[i]
+                qpos[root_q[0:3]] = root_pos[i]
+                qpos[root_q[3:7]] = root_quat[i]
+                qpos[joint_q] = joint_pos[i]
                 visualizer.add_ghost_mesh(qpos, model=model, label=f"ghost_{i}")
             return
-        ref_rot = matrix_from_quat(ref_bodies.quat).cpu().numpy()
-        data = env.robot.data
-        robot_pos = data.body_link_pos_w[:, self.body_ids].cpu().numpy()
-        robot_rot = matrix_from_quat(data.body_link_quat_w[:, self.body_ids])
-        robot_rot = robot_rot.cpu().numpy()
+        ref_pos = cmd.body_pos_w.cpu().numpy()
+        ref_rot = matrix_from_quat(cmd.body_quat_w).cpu().numpy()
+        robot_pos = cmd.robot_body_pos_w.cpu().numpy()
+        robot_rot = matrix_from_quat(cmd.robot_body_quat_w).cpu().numpy()
         for i in env_indices:
-            for j, name in enumerate(env.cfg.body_names):
+            for j, name in enumerate(cmd.body_names):
                 visualizer.add_frame(
                     position=ref_pos[i, j],
                     rotation_matrix=ref_rot[i, j],
@@ -135,7 +131,7 @@ class _MotionReference:
         request_action: Callable[[str, Any], None] | None = None,
     ) -> None:
         """Creates the motion frame scrubber in the Viser viewer."""
-        max_frame = int(self.env.motion.time_step_total) - 1
+        max_frame = int(self.env.command.motion.time_step_total) - 1
         with server.gui.add_folder("Motion"):
             scrubber = server.gui.add_slider(
                 "Frame", min=0, max=max_frame, step=1, initial_value=0
@@ -143,7 +139,12 @@ class _MotionReference:
 
             @scrubber.on_update
             def _(_) -> None:
-                self.env.frames[get_env_idx()] = int(scrubber.value)
+                cmd = self.env.command
+                cmd.time_steps = cmd.time_steps.index_fill(
+                    0,
+                    torch.tensor([get_env_idx()], device=cmd.time_steps.device),
+                    int(scrubber.value),
+                )
                 if on_change is not None:
                     on_change()
 
@@ -181,7 +182,7 @@ class _MotionReference:
         """Places envs on the reference state of the scrubber frame."""
         if not self._scrubber_handles:
             return False
-        self.env.reset_to_frame(env_ids, int(self._scrubber_handles[0].value))
+        self.env.command.reset_to_frame(env_ids, int(self._scrubber_handles[0].value))
         self.env.sim.forward()
         return True
 
@@ -214,7 +215,7 @@ class ViewerEnv:
         ghost_color: tuple[float, float, float, float] = (0.5, 0.7, 0.5, 0.5),
     ) -> None:
         self.env = env
-        self.cfg = env.cfg
+        self.cfg = SimpleNamespace(viewer=env.viewer_cfg)
         self.reward_manager = _RewardTerms(env)
         self.metrics_manager = _NoTerms()
         self.command_manager = _MotionReference(env, mode, ghost_color)
@@ -257,17 +258,14 @@ class ViewerEnv:
     def step(
         self, action: torch.Tensor
     ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        """Steps the env and refreshes the body poses that the viewer draws."""
+        """Steps the env and keeps the reward terms that the viewer plots."""
         result = self.env.step(action)
         self.reward_manager.terms = result[4]["terms"]
-        self.env.sim.forward()
         return result
 
     def reset(self, env_ids: torch.Tensor | None = None) -> tuple[TensorDict, dict]:
-        """Resets envs and refreshes the body poses that the viewer draws."""
-        result = self.env.reset(env_ids)
-        self.env.sim.forward()
-        return result
+        """Resets envs."""
+        return self.env.reset(env_ids)
 
     def update_visualizers(self, visualizer: DebugVisualizer) -> None:
         """Draws the reference motion."""

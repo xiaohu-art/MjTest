@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
+from tensordict import TensorDict
 from torch import nn
 
 from mj_test.utils.mlp import IFSQ, build_mlp
@@ -14,26 +13,11 @@ FSQ_SCALARS = 64
 FSQ_LEVELS = 33
 
 
-@dataclass
-class ActorCfg:
-    """Hyperparameters of the actor network.
-
-    Attributes:
-        hidden_dims: Hidden layer widths of the encoder and the decoder.
-    """
-
-    hidden_dims: tuple[int, ...] = (2048, 1024, 512, 256)
-
-
-@dataclass
-class CriticCfg:
-    """Hyperparameters of the critic network."""
-
-    hidden_dims: tuple[int, ...] = (256, 128)
-
-
 class Actor(nn.Module):
-    """Deterministic actor with a goal encoder and a proprio-conditioned decoder."""
+    """Deterministic actor with a goal encoder and a proprio-conditioned decoder.
+
+    It reads the ``proprio`` and ``goal`` observation groups.
+    """
 
     def __init__(
         self,
@@ -43,25 +27,24 @@ class Actor(nn.Module):
         hidden_dims: tuple[int, ...],
     ) -> None:
         super().__init__()
-        self.proprio_dim = proprio_dim
-        self.goal_dim = goal_dim
         self.proprio_normalizer = EmpiricalNormalization(proprio_dim)
         self.goal_normalizer = EmpiricalNormalization(goal_dim)
         self.encoder = build_mlp(goal_dim, hidden_dims, FSQ_SCALARS)
         self.quantizer = IFSQ(FSQ_LEVELS)
         self.decoder = build_mlp(FSQ_SCALARS + proprio_dim, hidden_dims, action_dim)
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """Computes the raw actions from the actor observations ``[proprio, goal]``."""
-        proprio, goal = obs.split([self.proprio_dim, self.goal_dim], dim=-1)
-        latent = self.quantizer(self.encoder(self.goal_normalizer(goal)))
-        return self.decoder(torch.cat([latent, self.proprio_normalizer(proprio)], -1))
+    def forward(self, obs: TensorDict) -> torch.Tensor:
+        """Computes the raw actions from the ``proprio`` and ``goal`` groups."""
+        latent = self.quantizer(self.encoder(self.goal_normalizer(obs["goal"])))
+        proprio = self.proprio_normalizer(obs["proprio"])
+        return self.decoder(torch.cat([latent, proprio], dim=-1))
 
-    def update_normalization(self, obs: torch.Tensor) -> None:
-        """Updates the input normalizers with real actor observations."""
-        proprio, goal = obs.split([self.proprio_dim, self.goal_dim], dim=-1)
+    def update_normalization(self, obs: TensorDict) -> None:
+        """Updates the input normalizers with real observations."""
         normalizers = (self.proprio_normalizer, self.goal_normalizer)
-        for normalizer, x in zip(normalizers, (proprio, goal), strict=True):
+        for normalizer, x in zip(
+            normalizers, (obs["proprio"], obs["goal"]), strict=True
+        ):
             normalizer.train()
             normalizer.update(x.reshape(-1, x.shape[-1]))
             normalizer.eval()

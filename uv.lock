@@ -1261,10 +1261,14 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "mjlab" },
+    { name = "omegaconf" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "mjlab", editable = "../mjlab" }]
+requires-dist = [
+    { name = "mjlab", editable = "../mjlab" },
+    { name = "omegaconf", specifier = ">=2.3" },
+]
 
 [[package]]
 name = "mjlab"
@@ -1749,6 +1753,18 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/49/ee/16bde09927e7ffacd50b117cd7d1dc764d145f03249fc41fdf6dfba3301f/nvidia_nvtx-13.2.86-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:968ce72baee2a01791c7d3254000eac81f24677b0b91c62d21b449a1f309c245", size = 153463, upload-time = "2026-07-16T09:41:23.242Z" },
     { url = "https://files.pythonhosted.org/packages/52/5f/74e2d29240de30a971d59ca20f4a3c4f2720cd49752809eeb4177d385c2c/nvidia_nvtx-13.2.86-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:1c6ae1be92fba569dd271f7b9b3056f99f5642726dc6c53d1b93ae4110c398fb", size = 154292, upload-time = "2026-07-16T09:40:53.791Z" },
+]
+
+[[package]]
+name = "omegaconf"
+version = "2.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyyaml" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cc/10/1cabf3188a4d9684a06568c7fd76f9536eede625733c8399cf1f5337b83e/omegaconf-2.4.0.tar.gz", hash = "sha256:7e219a70bea371da250285b9c01c7db027bc421722799c2cc4ff14bc4a2a753b", size = 3544508, upload-time = "2026-10-09T12:44:02.326Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4f/bd/0d9f8247b0819385213d09564eda5c52d3673313c2414d51f72883ec24cd/omegaconf-2.4.0-py3-none-any.whl", hash = "sha256:f141a664c777582405e3cc6e0545ecc79429e79f844995b1a6e71c35946a025c", size = 254152, upload-time = "2026-10-09T12:43:59.764Z" },
 ]
 
 [[package]]
@@ -2794,10 +2810,10 @@ dependencies = [
     { name = "numpy", marker = "sys_platform != 'darwin'" },
 ]
 wheels = [
-    { url = "https://pypi.nvidia.cn/warp-lang/warp_lang-1.19.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:c797f5f4aa9925f676e20dd28e5416fee794499f3f3c0a5b66f2d4dfc2de9e32" },
-    { url = "https://pypi.nvidia.cn/warp-lang/warp_lang-1.19.0-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:bc1511b8d5d987a69c2b18edbad721a8949b9f3622a91e3f9187a208fa9e3fab" },
-    { url = "https://pypi.nvidia.cn/warp-lang/warp_lang-1.19.0-py3-none-win_amd64.whl", hash = "sha256:bb4865dde4c2ae916d3d2a4e20ed1cd406e1d0a76ae722c3c574a9d43385c4d9" },
-    { url = "https://pypi.nvidia.cn/warp-lang/warp_lang-1.19.0-py3-none-win_arm64.whl", hash = "sha256:4f422ccdb3f5509e6386c0f178071d0da43e872e7af40dba594f03507af10182" },
+    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.19.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:c797f5f4aa9925f676e20dd28e5416fee794499f3f3c0a5b66f2d4dfc2de9e32" },
+    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.19.0-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:bc1511b8d5d987a69c2b18edbad721a8949b9f3622a91e3f9187a208fa9e3fab" },
+    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.19.0-py3-none-win_amd64.whl", hash = "sha256:bb4865dde4c2ae916d3d2a4e20ed1cd406e1d0a76ae722c3c574a9d43385c4d9" },
+    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.19.0-py3-none-win_arm64.whl", hash = "sha256:4f422ccdb3f5509e6386c0f178071d0da43e872e7af40dba594f03507af10182" },
 ]
 
 [[package]]

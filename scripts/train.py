@@ -1,77 +1,61 @@
-"""Trains the world model and the tracking policy."""
+"""Trains the world model and the tracking policy.
+
+Usage:
+    uv run scripts/train.py [--config <yaml>] [key.sub=value ...]
+    uv run scripts/train.py --resume True --load-run <regex>
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import cast
 
 import mjlab
 import tyro
-from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.utils.os import get_checkpoint_path
 from mjlab.utils.torch import configure_torch_backends
+from omegaconf import OmegaConf
 
-from mj_test.envs.sim_env import SimEnv, SimEnvCfg
-from mj_test.runner.runner import Runner, RunnerCfg
+from mj_test.envs.sim_env import SimEnv
+from mj_test.runner.runner import Runner
+
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
 
 @dataclass
-class TrainConfig:
-    """Configuration of a training run.
-
-    Attributes:
-        env: Env configuration.
-        runner: Runner configuration.
-        num_envs: Number of parallel envs.
-        device: Torch device.
-        resume: Whether to load a checkpoint before training.
-        load_run: Regex of the run directory under ``logs/<task>`` to resume from.
-            The latest match is loaded.
-        load_checkpoint: Regex of the checkpoint file in that run directory.
-    """
-
-    env: SimEnvCfg
-    runner: RunnerCfg
-    num_envs: int = 4096
-    device: str = "cuda:0"
+class TrainArgs:
+    config: Path = CONFIG_DIR / "train.yaml"
+    """Config file."""
     resume: bool = False
+    """Whether to load a checkpoint before training."""
     load_run: str = ".*"
-    load_checkpoint: str = r"model\.pt"
+    """Regex of the run under logs/<name> to resume. The latest match is loaded."""
+    load_checkpoint: str = r"model.*\.pt"
+    """Regex of the checkpoint file in that run. The latest match is loaded."""
 
 
 def main() -> None:
-    """Parses the task and its configuration, then trains."""
-    task_id, remaining_args = tyro.cli(
-        tyro.extras.literal_type_from_choices(list_tasks()),
-        add_help=False,
-        return_unknown_args=True,
-        config=mjlab.TYRO_FLAGS,
+    """Loads the config, then trains."""
+    args, overrides = tyro.cli(
+        TrainArgs, return_unknown_args=True, config=mjlab.TYRO_FLAGS
     )
-    cfg = tyro.cli(
-        TrainConfig,
-        args=remaining_args,
-        default=TrainConfig(
-            env=cast(SimEnvCfg, load_env_cfg(task_id)),
-            runner=cast(RunnerCfg, load_rl_cfg(task_id)),
-        ),
-        config=mjlab.TYRO_FLAGS,
-    )
+    cfg = OmegaConf.load(args.config)
+    OmegaConf.set_struct(cfg, True)  # Overrides may only set existing keys.
+    cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
     configure_torch_backends()
-    log_root = Path("logs", task_id)
+    log_root = Path("logs", cfg.name)
     resume_path = (
-        get_checkpoint_path(log_root, cfg.load_run, cfg.load_checkpoint)
-        if cfg.resume
+        get_checkpoint_path(log_root, args.load_run, args.load_checkpoint)
+        if args.resume
         else None
     )
-    cfg.env.scene.num_envs = cfg.num_envs
-    cfg.env.seed = cfg.runner.seed
-    env = SimEnv(cfg.env, device=cfg.device)
+    env = SimEnv(cfg.env, device=cfg.device, seed=cfg.seed)
     log_dir = log_root / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "params").mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(cfg, log_dir / "params" / "config.yaml")
     print(f"[INFO] Logging to {log_dir}")
-    runner = (load_runner_cls(task_id) or Runner)(env, cfg.runner, log_dir)
+    runner = Runner(env, cfg.runner, log_dir)
     if resume_path is not None:
         print(f"[INFO] Resuming from {resume_path}")
         runner.load(resume_path)

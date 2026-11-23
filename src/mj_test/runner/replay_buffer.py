@@ -2,68 +2,23 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 from tensordict import TensorDict
 
 
-@dataclass(frozen=True)
-class FieldSpec:
-    """Shape and dtype of one replay buffer field.
-
-    Attributes:
-        dim: Size of the trailing axis, or 0 for one scalar per transition.
-        dtype: Element type.
-    """
-
-    dim: int = 0
-    dtype: torch.dtype = torch.float32
-
-    def shape(self, num_envs: int, buffer_size: int) -> tuple[int, ...]:
-        """Returns the storage shape ``(num_envs, buffer_size[, dim])`` of the field."""
-        if self.dim:
-            return (num_envs, buffer_size, self.dim)
-        return (num_envs, buffer_size)
-
-
 class ReplayBuffer:
-    """Per-env circular buffer over a TensorDict.
-
-    Args:
-        schema: Spec of each field.
-        buffer_size: Number of transitions kept per env.
-        num_envs: Number of envs.
-        device: Device that stores the fields.
-    """
-
-    def __init__(
-        self,
-        schema: dict[str, FieldSpec],
-        buffer_size: int,
-        num_envs: int,
-        device: str = "cpu",
-    ) -> None:
-        if not {"terminated", "truncated"} <= schema.keys():
-            raise ValueError("The schema needs 'terminated' and 'truncated' fields.")
+    def __init__(self, row: TensorDict, buffer_size: int, device: str = "cpu") -> None:
+        if not {"terminated", "truncated"} <= set(row.keys()):
+            raise ValueError("The rows need 'terminated' and 'truncated' fields.")
         self.num_transitions = 0
         self.buffer_size = buffer_size
-        self.num_envs = num_envs
+        self.num_envs = row.batch_size[0]
         self.device = device
         self._step = 0
-        self._storage = TensorDict(
-            {
-                name: torch.zeros(
-                    spec.shape(num_envs, buffer_size), dtype=spec.dtype, device=device
-                )
-                for name, spec in schema.items()
-            },
-            batch_size=[num_envs, buffer_size],
-            device=device,
-        )
+        storage = row.to(device).unsqueeze(1).expand(self.num_envs, buffer_size)
+        self._storage = storage.clone().zero_()
 
     def insert(self, td: TensorDict) -> None:
-        """Writes one transition of every env, overwriting the oldest when full."""
         if td.batch_size != torch.Size([self.num_envs]):
             raise ValueError(
                 f"insert expects batch_size=[{self.num_envs}], got {list(td.batch_size)}."
@@ -79,10 +34,6 @@ class ReplayBuffer:
 
     def sample(self, sequence_length: int, batch_size: int) -> TensorDict:
         """Samples windows of consecutive transitions from single episodes.
-
-        Args:
-            sequence_length: Number of frames per window, ``L``.
-            batch_size: Number of windows, ``B``.
 
         Returns:
             The windows, with batch size (B, L) and the oldest frame first.

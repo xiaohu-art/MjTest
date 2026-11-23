@@ -1,0 +1,184 @@
+# Training config of the G1 motion tracking task.
+#
+# Usage:
+#   uv run scripts/train.py
+#   uv run scripts/train.py env.num_envs=2048 runner.policy.batch_size=4096
+#   uv run scripts/train.py --resume True --load-run <regex>
+
+name: Mjtest-Tracking-G1  # Runs log to logs/<name>/<timestamp>/.
+seed: 42
+device: cuda:0
+
+# =============================================================================
+# Environment
+# =============================================================================
+
+env:
+  num_envs: 4096
+  decimation: 4  # Physics steps per env step.
+  episode_length_s: 10.0
+
+  scene:
+    robot: mjlab.asset_zoo.robots:get_g1_robot_cfg
+    entity_name: robot
+    terrain: plane
+
+  sim:
+    timestep: 0.005
+    iterations: 10
+    ls_iterations: 20
+    nconmax: 35
+    njmax: 250
+
+  action:
+    actuator_names: [".*"]
+    scale: mjlab.asset_zoo.robots:G1_ACTION_SCALE
+    use_default_offset: true
+
+  # ---- reference motion ----
+  command:
+    class_type: mj_test.mdp.command:MotionCommand
+    motion_file: /data/motion_data/datasets/lafan1/*.npz
+    body_names:  # Tracked bodies, anchor first.
+      - pelvis
+      - left_hip_roll_link
+      - left_knee_link
+      - left_ankle_roll_link
+      - right_hip_roll_link
+      - right_knee_link
+      - right_ankle_roll_link
+      - torso_link
+      - left_shoulder_roll_link
+      - left_elbow_link
+      - left_wrist_yaw_link
+      - right_shoulder_roll_link
+      - right_elbow_link
+      - right_wrist_yaw_link
+    pose_range:
+      x: [-0.05, 0.05]
+      y: [-0.05, 0.05]
+      z: [-0.01, 0.01]
+      roll: [-0.1, 0.1]
+      pitch: [-0.1, 0.1]
+      yaw: [-0.2, 0.2]
+    velocity_range:
+      x: [-0.5, 0.5]
+      y: [-0.5, 0.5]
+      z: [-0.2, 0.2]
+      roll: [-0.52, 0.52]
+      pitch: [-0.52, 0.52]
+      yaw: [-0.78, 0.78]
+    joint_position_range: [-0.1, 0.1]
+    num_goal_frames: 10
+    goal_frame_stride: 5
+    sampler:
+      bin_s: 0.2
+      mode: return  # [uniform, return]
+      returns:
+        gamma: 0.99
+        horizon: 20
+        memory: 256
+        steepness: 25.0
+        explore: 0.5
+        keep: 0.1
+
+  # ---- observation groups ----
+  observations:
+    proprio:
+      enable_noise: true
+      terms:
+        projected_gravity: { func: projected_gravity, noise: [-0.05, 0.05] }
+        base_ang_vel:      { func: base_ang_vel, noise: [-0.2, 0.2] }
+        joint_pos:         { func: joint_pos_rel, noise: [-0.01, 0.01] }
+        joint_vel:         { func: joint_vel_rel, noise: [-0.5, 0.5] }
+        actions:           { func: last_action }
+    goal:
+      terms:
+        motion: { func: motion_goal }
+    critic:
+      terms:
+        state:   { func: robot_local_state }
+        goal:    { func: motion_goal }
+        sim_ctx: { func: sim_ctx }
+
+  # ---- reward weights & params ----
+  rewards:
+    motion_global_root_pos: { func: global_anchor_position_error_exp, weight: 0.5, params: { std: 0.3 } }
+    motion_global_root_ori: { func: global_anchor_orientation_error_exp, weight: 0.5, params: { std: 0.4 } }
+    motion_body_pos:        { func: relative_body_position_error_exp, weight: 1.0, params: { std: 0.3 } }
+    motion_body_ori:        { func: relative_body_orientation_error_exp, weight: 1.0, params: { std: 0.4 } }
+    motion_body_lin_vel:    { func: global_body_linear_velocity_error_exp, weight: 1.0, params: { std: 1.0 } }
+    motion_body_ang_vel:    { func: global_body_angular_velocity_error_exp, weight: 1.0, params: { std: 3.14 } }
+    action_rate_l2:         { func: action_rate, weight: -0.1 }
+    joint_limit:            { func: joint_limit_violation, weight: -2.0 }
+
+  terminations:
+    time_out:   { func: time_out, time_out: true }
+    motion_end: { func: motion_end, time_out: true }
+    anchor_pos: { func: anchor_height_error, threshold: 0.25 }
+    anchor_ori: { func: anchor_tilt_error, threshold: 0.8 }
+
+  # ---- domain randomization ----
+  events:
+    base_com:
+      func: body_com_offset
+      mode: startup
+      params:
+        asset_cfg: { name: robot, body_names: [torso_link] }
+        operation: add
+        ranges: { 0: [-0.025, 0.025], 1: [-0.05, 0.05], 2: [-0.05, 0.05] }
+    encoder_bias:
+      func: encoder_bias
+      mode: startup
+      params:
+        asset_cfg: { name: robot }
+        bias_range: [-0.01, 0.01]
+    foot_friction:
+      func: geom_friction
+      mode: startup
+      params:
+        asset_cfg: { name: robot, geom_names: "^(left|right)_foot[1-7]_collision$" }
+        operation: abs
+        ranges: [0.3, 1.2]
+        shared_random: true  # All foot geoms share the same friction.
+
+  viewer: {}  # Fields of mjlab's ViewerConfig.
+
+# =============================================================================
+# Runner (world model + policy)
+# =============================================================================
+
+runner:
+  max_iterations: 1000000
+  replay_ratio: 16
+  buffer_size: 1000
+  action_noise: 0.1
+  termination_softness: 0.05
+  log_interval: 10
+  save_interval: 1000
+
+  dynamics: { hidden_dims: [2048, 2048, 2048] }
+  actor: { hidden_dims: [2048, 1024, 512, 256] }  # Encoder and decoder widths.
+  critic: { hidden_dims: [256, 128] }
+
+  wm:
+    lr: 2.0e-4
+    num_batches: 10
+    batch_size: 2048
+    horizon: 8
+    max_grad_norm: 1.0
+    nominal_errors: { root_pos: 0.01, root_ori: 0.02, joint_pos: 0.1, joint_vel: 3.14 }
+
+  policy:
+    lr: 2.0e-4
+    num_batches: 1
+    batch_size: 2048
+    horizon: 32
+    gamma: 0.99
+    lam: 0.95
+    survival_masking: true
+    beta2: 0.95
+    max_grad_norm: 1.0
+    grad_clip_value: 0.1
+    critic_epochs: 5
+    critic_minibatches: 4

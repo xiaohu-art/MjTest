@@ -26,9 +26,9 @@ def _mean_scale(lo: float, hi: float) -> tuple[float, float]:
 
 def _event_params(env: SimEnv, name: str) -> dict[str, Any]:
     """Returns the parameters of a domain randomization event."""
-    event_cfg = env.cfg.events.get(name)
+    event_cfg = env.events.get(name)
     if event_cfg is None:
-        raise RuntimeError(f"No event '{name}' in env.cfg.events.")
+        raise RuntimeError(f"No event '{name}' in env.events.")
     return event_cfg.params
 
 
@@ -195,10 +195,10 @@ class SimContext(nn.Module):
             CoMOffsetSpec,
             EncoderBiasSpec,
         )
-        specs = [c() for c in candidates if c.name in env.cfg.events]
+        specs = [c() for c in candidates if c.name in env.events]
         if not specs:
             raise RuntimeError(
-                "No randomization event in env.cfg.events has a sim context spec. "
+                "No randomization event in env.events has a sim context spec. "
                 "Enable at least one of foot_friction, base_com and encoder_bias."
             )
         ranges = [r for spec in specs for r in spec.bind(env)]

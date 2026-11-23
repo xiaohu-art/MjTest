@@ -1,0 +1,17 @@
+# Playback config. Inherits train.yaml and overrides what differs at play time.
+#
+# Usage:
+#   uv run scripts/play.py [--load-run <regex>] [--viewer native|viser] [--from-start True]
+#   uv run scripts/play.py env.num_envs=4
+
+env:
+  num_envs: 16
+  episode_length_s: 1.0e9
+  observations:
+    proprio:
+      enable_noise: false
+  command:
+    pose_range: null
+    velocity_range: null
+    sampler:
+      mode: uniform

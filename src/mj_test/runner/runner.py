@@ -5,58 +5,32 @@ from __future__ import annotations
 import datetime
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, cast
 
 import torch
-from mjlab.utils.os import dump_yaml
+from omegaconf import DictConfig
 from tensordict import TensorDict
 from torch.utils.tensorboard import SummaryWriter
 
 from mj_test.envs.imagination_env import ImaginationEnv
 from mj_test.envs.sim_env import SimEnv
-from mj_test.policy.learner import ActorCriticPolicyLearner, ActorCriticPolicyLearnerCfg
-from mj_test.policy.networks import Actor, ActorCfg, Critic, CriticCfg
-from mj_test.runner.replay_buffer import FieldSpec, ReplayBuffer
-from mj_test.runner.return_sampler import ReturnSampler, ReturnSamplerCfg
-from mj_test.wm.dynamics import Dynamics, DynamicsCfg
-from mj_test.wm.learner import WorldModelLearner, WorldModelLearnerCfg
+from mj_test.mdp.command import MotionCommand
+from mj_test.policy.learner import ActorCriticPolicyLearner
+from mj_test.policy.networks import Actor, Critic
+from mj_test.runner.replay_buffer import ReplayBuffer
+from mj_test.utils.forward_kinematics import GenCoords
+from mj_test.wm.dynamics import Dynamics
+from mj_test.wm.learner import WorldModelLearner
 from mj_test.wm.representation import delta_dim, local_state
 
 
-@dataclass
-class RunnerCfg:
-    """Hyperparameters of the training loop."""
-
-    seed: int = 42
-    max_iterations: int = 1_000_000
-    replay_ratio: int = 16
-    buffer_size: int = 1000
-    action_noise: float = 0.1
-    sampling: Literal["uniform", "return"] = "return"
-    termination_softness: float = 0.05
-    log_interval: int = 10
-    save_interval: int = 1000
-    dynamics: DynamicsCfg = field(default_factory=DynamicsCfg)
-    actor: ActorCfg = field(default_factory=ActorCfg)
-    critic: CriticCfg = field(default_factory=CriticCfg)
-    wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
-    policy: ActorCriticPolicyLearnerCfg = field(
-        default_factory=ActorCriticPolicyLearnerCfg
-    )
-    return_sampler: ReturnSamplerCfg = field(default_factory=ReturnSamplerCfg)
-
-
 class Ratio:
-    """Converts a fractional number of updates per step into whole updates."""
-
     def __init__(self, ratio: float) -> None:
         self._ratio = ratio
         self._credit = 0.0
 
     def __call__(self) -> int:
-        """Advances by one step and returns the whole number of updates due."""
         self._credit += self._ratio
         repeats = int(self._credit)
         self._credit -= repeats
@@ -64,86 +38,62 @@ class Ratio:
 
 
 class Runner:
-    """Trains the world model and the policy on transitions collected from the env.
-
-    Args:
-        env: The simulated tracking env.
-        cfg: Runner hyperparameters.
-        log_dir: Directory of the logs and checkpoints. None for a runner that only
-            loads checkpoints.
-    """
+    """Trains the world model and the policy on transitions collected from the env."""
 
     def __init__(
-        self, env: SimEnv, cfg: RunnerCfg, log_dir: Path | None = None
+        self, env: SimEnv, cfg: DictConfig, log_dir: Path | None = None
     ) -> None:
         self.env = env
         self.cfg = cfg
         self.log_dir = log_dir
         self.iteration = 0
         self.device = env.device
-        self.sim_context = env.sim_context
 
         self.obs, _ = env.reset()
-        state = env.robot_state
-        state_dim = local_state(state).shape[-1]
-        goal_dim = env.goal().shape[-1]
-        proprio_dim = self.obs["actor"].shape[-1] - goal_dim
-        sim_ctx_dim = self.sim_context.dim
-        action_term = env.action_term
-        action_dim = action_term.action_dim
-        action_shape = (env.num_envs, action_dim)
-        scale = torch.as_tensor(action_term.scale, device=self.device).expand(
-            action_shape
-        )[0]
-        offset = torch.as_tensor(action_term.offset, device=self.device).expand(
-            action_shape
-        )[0]
-        decimation = env.cfg.decimation
+        gen = GenCoords.from_entity(env.entity, env.env_origins)
+        state_dim = local_state(gen).shape[-1]
+        goal_dim = self.obs["goal"].shape[-1]
+        proprio_dim = self.obs["proprio"].shape[-1]
+        sim_ctx_dim = env.sim_context.dim
+        action_dim = env.action_term.dim
+        decimation = env.decimation
 
         self.dynamics = Dynamics(
             state_dim,
-            action_dim,
             sim_ctx_dim,
-            delta_dim(state),
-            scale.float(),
-            offset.float(),
+            delta_dim(gen),
+            env.action_term,
             dt=env.dt,
             substep_coeff=(decimation + 1) / (2 * decimation),
-            **asdict(cfg.dynamics),
+            hidden_dims=tuple(cfg.dynamics.hidden_dims),
         ).to(self.device)
-        self.actor = Actor(proprio_dim, goal_dim, action_dim, **asdict(cfg.actor)).to(
-            self.device
-        )
-        self.critic = Critic(self.obs["critic"].shape[-1], **asdict(cfg.critic)).to(
-            self.device
-        )
+        self.actor = Actor(
+            proprio_dim, goal_dim, action_dim, tuple(cfg.actor.hidden_dims)
+        ).to(self.device)
+        self.critic = Critic(
+            self.obs["critic"].shape[-1], tuple(cfg.critic.hidden_dims)
+        ).to(self.device)
 
-        schema = {
-            name: FieldSpec(value.shape[-1]) for name, value in state.to_dict().items()
-        } | {
-            "action": FieldSpec(action_dim),
-            "prev_action": FieldSpec(action_dim),
-            "frame": FieldSpec(dtype=torch.long),
-            "sim_ctx": FieldSpec(sim_ctx_dim),
-            "terminated": FieldSpec(dtype=torch.bool),
-            "truncated": FieldSpec(dtype=torch.bool),
-        }
-        self.buffer = ReplayBuffer(schema, cfg.buffer_size, env.num_envs, self.device)
+        done = torch.zeros(env.num_envs, dtype=torch.bool, device=self.device)
+        action = env.action_term.action
+        time_steps = cast(MotionCommand, env.command).time_steps
+        row = TensorDict(
+            {
+                "gen": gen,
+                "sim_ctx": env.sim_ctx,
+                "time_steps": time_steps,
+                "prev_action": action,
+                "action": action,
+                "terminated": done,
+                "truncated": done,
+            },
+            batch_size=[env.num_envs],
+        )
+        self.buffer = ReplayBuffer(row, cfg.buffer_size, self.device)
         self.wm_learner = WorldModelLearner(self.dynamics, cfg.wm)
         self.imagination = ImaginationEnv(env, self.dynamics, cfg.termination_softness)
         self.policy_learner = ActorCriticPolicyLearner(
             self.actor, self.critic, self.imagination, cfg.policy
-        )
-        self.sampler = (
-            ReturnSampler(
-                cfg.return_sampler,
-                env.bin_count,
-                env.num_envs,
-                self.imagination.max_step_reward,
-                self.device,
-            )
-            if cfg.sampling == "return"
-            else None
         )
 
     def run(self) -> None:
@@ -196,66 +146,51 @@ class Runner:
     def collect(self) -> None:
         """Steps the env once with the noisy actor and stores the transition."""
         env = self.env
-        state = env.robot_state.clone()
-        frame = env.frames.clone()
-        prev_action = env.action.clone()
-        obs = self.obs["actor"]
+        gen = GenCoords.from_entity(env.entity, env.env_origins)
+        sim_ctx = env.sim_ctx
+        time_steps = cast(MotionCommand, env.command).time_steps
+        prev_action = env.action_term.action
+        obs = self.obs
         action = self.actor(obs)
         action = action + self.cfg.action_noise * torch.randn_like(action)
 
-        self.obs, reward, terminated, truncated, extras = env.step(action)
-        fell = terminated & ~truncated
+        self.obs, _, terminated, truncated, _ = env.step(action)
         self.buffer.insert(
             TensorDict(
                 {
-                    **state.to_dict(),
-                    "action": action,
+                    "gen": gen,
+                    "sim_ctx": sim_ctx,
+                    "time_steps": time_steps,
                     "prev_action": prev_action,
-                    "frame": frame,
-                    "sim_ctx": env.sim_ctx,
-                    "terminated": fell,
+                    "action": action,
+                    "terminated": terminated & ~truncated,  # Falls only.
                     "truncated": truncated,
                 },
                 batch_size=[env.num_envs],
             )
         )
-        self.wm_learner.update_normalization(state, action)
+        self.wm_learner.update_normalization(gen, action)
         self.actor.update_normalization(obs)
 
-        if self.sampler is not None:
-            clip_end = extras["clip_end"]
-            probs = self.sampler.record(
-                env.frame_bins(frame),
-                env.frame_bins(frame + 1),
-                reward,
-                fell,
-                clip_end,
-                truncated & ~clip_end,
-            )
-            if probs is not None:
-                env.set_sampling_distribution(probs)
-
     def save(self) -> None:
-        """Saves the configuration and the training state to the log directory."""
+        """Saves the training state to ``model_<iteration>.pt`` in the log
+        directory."""
         if self.log_dir is None:
             raise ValueError("Runner.save needs a log_dir.")
-        dump_yaml(self.log_dir / "params" / "runner.yaml", asdict(self.cfg))
-        sampler = None if self.sampler is None else self.sampler.state_dict()
         checkpoint = {
             "iteration": self.iteration,
             "metadata": self._metadata(),
             "dynamics": self.dynamics.state_dict(),
-            "sim_context": self.sim_context.state_dict(),
+            "sim_context": self.env.sim_context.state_dict(),
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "optimizers": {
                 name: [optimizer.state_dict() for optimizer in optimizers]
                 for name, optimizers in self._optimizers().items()
             },
-            "return_sampler": sampler,
-            "sampling_probs": self.env.sampling_probs,
+            **self.env.command.state_dict(),
         }
-        path = self.log_dir / "model.pt"
+        path = self.log_dir / f"model_{self.iteration}.pt"
         torch.save(checkpoint, path.with_suffix(".tmp"))
         path.with_suffix(".tmp").replace(path)
 
@@ -265,7 +200,7 @@ class Runner:
         Args:
             path: Path of the checkpoint.
             networks_only: Whether to load only the networks and their normalizers,
-                keeping the current optimizers, return sampler and iteration.
+                keeping the current optimizers, reset distribution and iteration.
         """
         checkpoint = torch.load(path, map_location=self.device, weights_only=True)
         for key, value in self._metadata().items():
@@ -274,8 +209,8 @@ class Runner:
                 raise ValueError(
                     f"{path} was trained with {key} {saved}, but the env has {value}."
                 )
-        self.dynamics.load_state_dict(checkpoint["dynamics"])
-        self.sim_context.load_state_dict(checkpoint["sim_context"])
+        self.dynamics.load_state_dict(self._dynamics_state(path, checkpoint))
+        self.env.sim_context.load_state_dict(checkpoint["sim_context"])
         self.actor.load_state_dict(checkpoint["actor"])
         self.critic.load_state_dict(checkpoint["critic"])
         if networks_only:
@@ -284,18 +219,16 @@ class Runner:
             states = checkpoint["optimizers"][name]
             for optimizer, state in zip(optimizers, states, strict=True):
                 optimizer.load_state_dict(state)
-        if self.sampler is not None and checkpoint["return_sampler"] is not None:
-            self.sampler.load_state_dict(checkpoint["return_sampler"])
-            self.env.set_sampling_distribution(checkpoint["sampling_probs"])
+        self.env.command.load_state_dict(checkpoint)
         self.iteration = checkpoint["iteration"]
 
-    def get_inference_policy(self) -> Callable[[dict], torch.Tensor]:
+    def get_inference_policy(self) -> Callable[[TensorDict], torch.Tensor]:
         """Returns the deterministic actor as a function of the env observations."""
         self.actor.eval()
 
         @torch.no_grad()
-        def policy(obs: dict) -> torch.Tensor:
-            return self.actor(obs["actor"])
+        def policy(obs: TensorDict) -> torch.Tensor:
+            return self.actor(obs)
 
         return policy
 
@@ -308,13 +241,34 @@ class Runner:
         }
 
     def _metadata(self) -> dict[str, list[str]]:
-        """Returns the joint, action, body and sim context names of the networks."""
+        """Returns the joint, action, tracked body and sim context names of the
+        networks."""
+        command = cast(MotionCommand, self.env.command)
         return {
-            "joint_names": list(self.env.robot.joint_names),
-            "action_names": list(self.env.action_term.target_names),
-            "body_names": list(self.env.cfg.body_names),
-            "sim_context": [spec.name for spec in self.sim_context.specs],
+            "joint_names": list(self.env.entity.joint_names),
+            "action_names": list(self.dynamics.action_term.names),
+            "body_names": list(command.body_names),
+            "sim_context": [spec.name for spec in self.env.sim_context.specs],
         }
+
+    def _dynamics_state(
+        self, path: Path, checkpoint: dict[str, Any]
+    ) -> dict[str, torch.Tensor]:
+        """Returns the saved dynamics state without the action map of old checkpoints.
+
+        Checkpoints written before ``JointPositionAction`` kept the action scale and offset
+        in the dynamics. They must match the env's, which the dynamics now uses.
+        """
+        state = dict(checkpoint["dynamics"])
+        targets = self.dynamics.action_term
+        for key, value in (
+            ("action_scale", targets.scale),
+            ("action_offset", targets.offset),
+        ):
+            saved = state.pop(key, None)
+            if saved is not None and not torch.allclose(saved, value):
+                raise ValueError(f"{path} was trained with another {key} than the env.")
+        return state
 
     def _log(
         self,

@@ -3,32 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
 
 import torch
+from omegaconf import DictConfig
 from tensordict import TensorDict
 from torch import nn
 
 from mj_test.envs.imagination_env import ImaginationEnv
 from mj_test.utils.optim import CapturedUpdate, build_optimizers, optimize_step
-
-
-@dataclass
-class ActorCriticPolicyLearnerCfg:
-    """Hyperparameters of the actor-critic policy learner."""
-
-    lr: float = 2e-4
-    num_batches: int = 1
-    batch_size: int = 4096
-    horizon: int = 32
-    gamma: float = 0.99
-    lam: float = 0.95
-    survival_masking: bool = True
-    beta2: float = 0.95
-    max_grad_norm: float = 1.0
-    grad_clip_value: float = 0.1
-    critic_epochs: int = 5
-    critic_minibatches: int = 4
 
 
 def gae_returns(
@@ -97,14 +79,21 @@ def actor_objective(
 
 
 class ActorCriticPolicyLearner:
-    """Trains the actor on imagined returns and fits the critic with GAE."""
+    """Trains the actor on imagined returns and fits the critic with GAE.
+
+    Args:
+        actor: The actor.
+        critic: The critic.
+        imagination: Env that rolls the actor out in the world model.
+        cfg: The ``runner.policy`` section of the config.
+    """
 
     def __init__(
         self,
         actor: nn.Module,
         critic: nn.Module,
         imagination: ImaginationEnv,
-        cfg: ActorCriticPolicyLearnerCfg,
+        cfg: DictConfig,
     ) -> None:
         self.actor = actor
         self.critic = critic
@@ -169,10 +158,12 @@ class ActorCriticPolicyLearner:
             before each step, the ``reward`` and the termination probability
             ``done``, and the observations after the last step.
         """
-        obs = self.imagination.reset(start)
+        obs = self.imagination.reset(
+            start["gen"], start["sim_ctx"], start["time_steps"], start["prev_action"]
+        )
         steps = []
         for _ in range(self.cfg.horizon):
-            action = self.actor(obs["actor"])
+            action = self.actor(obs)
             next_obs, reward, term_prob, _, _ = self.imagination.step(action)
             step = {"critic": obs["critic"], "reward": reward, "done": term_prob}
             steps.append(TensorDict(step, batch_size=reward.shape))

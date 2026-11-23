@@ -24,61 +24,60 @@ __all__ = [
 
 def global_anchor_position_error_exp(env: Env, std: float) -> torch.Tensor:
     """Computes the anchor position tracking reward."""
-    error = torch.sum(
-        torch.square(env.ref_bodies.pos[..., 0, :] - env.robot_bodies.pos[..., 0, :]),
-        dim=-1,
-    )
+    cmd = env.command
+    error = torch.sum(torch.square(cmd.anchor_pos_w - cmd.robot_anchor_pos_w), dim=-1)
     return torch.exp(-error / std**2)
 
 
 def global_anchor_orientation_error_exp(env: Env, std: float) -> torch.Tensor:
     """Computes the anchor orientation tracking reward."""
-    error = (
-        quat_error_magnitude(
-            env.ref_bodies.quat[..., 0, :], env.robot_bodies.quat[..., 0, :]
-        )
-        ** 2
-    )
+    cmd = env.command
+    error = quat_error_magnitude(cmd.anchor_quat_w, cmd.robot_anchor_quat_w) ** 2
     return torch.exp(-error / std**2)
 
 
 def relative_body_position_error_exp(env: Env, std: float) -> torch.Tensor:
     """Computes the body position tracking reward, averaged over bodies."""
-    error = torch.sum(torch.square(env.ref_bodies.pos - env.robot_bodies.pos), dim=-1)
+    cmd = env.command
+    error = torch.sum(torch.square(cmd.body_pos_w - cmd.robot_body_pos_w), dim=-1)
     return torch.exp(-error.mean(-1) / std**2)
 
 
 def relative_body_orientation_error_exp(env: Env, std: float) -> torch.Tensor:
     """Computes the body orientation tracking reward, averaged over bodies."""
-    error = quat_error_magnitude(env.ref_bodies.quat, env.robot_bodies.quat) ** 2
+    cmd = env.command
+    error = quat_error_magnitude(cmd.body_quat_w, cmd.robot_body_quat_w) ** 2
     return torch.exp(-error.mean(-1) / std**2)
 
 
 def global_body_linear_velocity_error_exp(env: Env, std: float) -> torch.Tensor:
     """Computes the body linear velocity tracking reward, averaged over bodies."""
+    cmd = env.command
     error = torch.sum(
-        torch.square(env.ref_bodies.lin_vel - env.robot_bodies.lin_vel), dim=-1
+        torch.square(cmd.body_lin_vel_w - cmd.robot_body_lin_vel_w), dim=-1
     )
     return torch.exp(-error.mean(-1) / std**2)
 
 
 def global_body_angular_velocity_error_exp(env: Env, std: float) -> torch.Tensor:
     """Computes the body angular velocity tracking reward, averaged over bodies."""
+    cmd = env.command
     error = torch.sum(
-        torch.square(env.ref_bodies.ang_vel - env.robot_bodies.ang_vel), dim=-1
+        torch.square(cmd.body_ang_vel_w - cmd.robot_body_ang_vel_w), dim=-1
     )
     return torch.exp(-error.mean(-1) / std**2)
 
 
 def action_rate(env: Env) -> torch.Tensor:
     """Computes the action rate penalty."""
-    return torch.sum(torch.square(env.action - env.prev_action), dim=-1)
+    actions = env.action_term
+    return (actions.action - actions.prev_action).square().sum(dim=-1)
 
 
 def joint_limit_violation(env: Env) -> torch.Tensor:
     """Computes the joint position violation of the soft limits, summed over joints."""
-    joint_pos = env.robot_state.joint_pos
-    lower, upper = env.joint_limits.unbind(-1)
-    out_of_limits = -(joint_pos - lower).clip(max=0.0)
-    out_of_limits += (joint_pos - upper).clip(min=0.0)
+    robot = env.robot
+    lower, upper = robot.soft_joint_pos_limits.unbind(-1)
+    out_of_limits = -(robot.joint_pos - lower).clip(max=0.0)
+    out_of_limits += (robot.joint_pos - upper).clip(min=0.0)
     return torch.sum(out_of_limits, dim=-1)
