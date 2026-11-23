@@ -140,10 +140,9 @@ class _MotionReference:
             @scrubber.on_update
             def _(_) -> None:
                 cmd = self.env.command
-                cmd.time_steps = cmd.time_steps.index_fill(
-                    0,
-                    torch.tensor([get_env_idx()], device=cmd.time_steps.device),
-                    int(scrubber.value),
+                env_ids = torch.tensor([get_env_idx()], device=cmd.time_steps.device)
+                cmd.set_time_steps(
+                    cmd.time_steps.index_fill(0, env_ids, int(scrubber.value))
                 )
                 if on_change is not None:
                     on_change()

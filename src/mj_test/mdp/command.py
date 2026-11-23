@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import copy
-import glob
-from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -26,50 +24,39 @@ if TYPE_CHECKING:
 
 __all__ = ["MotionCommand", "MotionLibrary"]
 
-_FK_CHUNK = 65536
-
 
 class MotionLibrary:
+    """Reference clips."""
+
     def __init__(
-        self,
-        motion_file: str | Sequence[str],
-        kinematics: KinematicModel,
-        device: str = "cpu",
+        self, motion_file: str, kinematics: KinematicModel, device: str = "cpu"
     ) -> None:
-        patterns = [motion_file] if isinstance(motion_file, str) else motion_file
-        motion_files = [path for p in patterns for path in sorted(glob.glob(p))]
-        if not motion_files:
-            raise FileNotFoundError(f"No motion clip matches {motion_file!r}.")
-        clips: list[dict[str, np.ndarray]] = []
-        for path in motion_files:
-            with np.load(path) as data:
-                clips.append(dict(data))
-
-        def cat(arrays: list[np.ndarray]) -> torch.Tensor:
-            return torch.from_numpy(np.concatenate(arrays)).to(
-                device=device, dtype=torch.float32
-            )
-
-        joint_pos = cat([clip["joint_pos"] for clip in clips])
-        self.time_step_total = joint_pos.shape[0]
+        with np.load(motion_file) as data:
+            states = torch.from_numpy(data["states"]).to(device)
+            self.motion_ends = torch.from_numpy(data["motion_ends"]).to(device)
+            self.motion_names: list[str] = data["motion_names"].tolist()
+            self.fps = float(data["fps"])
+        num_joints = kinematics.default_joint_pos.shape[0]
+        self.time_step_total = states.shape[0]
+        root_pos, root_quat, root_lin_vel, root_ang_vel, joint_pos, joint_vel = (
+            states.split([3, 4, 3, 3, num_joints, num_joints], dim=-1)
+        )
         self.gen = GenCoords(
-            root_pos=cat([clip["body_pos_w"][:, 0] for clip in clips]),
-            root_quat=cat([clip["body_quat_w"][:, 0] for clip in clips]),
+            root_pos=root_pos,
+            root_quat=root_quat,
             joint_pos=joint_pos,
-            root_lin_vel=cat([clip["body_lin_vel_w"][:, 0] for clip in clips]),
-            root_ang_vel=cat([clip["body_ang_vel_w"][:, 0] for clip in clips]),
-            joint_vel=cat([clip["joint_vel"] for clip in clips]),
+            root_lin_vel=root_lin_vel,
+            root_ang_vel=root_ang_vel,
+            joint_vel=joint_vel,
             batch_size=[self.time_step_total],
         )
-        with torch.no_grad():
-            chunks = self.gen.split(_FK_CHUNK)
-            self.bodies = torch.cat([kinematics.bodies(chunk) for chunk in chunks])
+        self.kinematics = kinematics
 
-        self.motion_ends = torch.as_tensor(
-            np.cumsum([clip["joint_pos"].shape[0] for clip in clips]),
-            dtype=torch.long,
-            device=device,
-        )
+    def body_state(
+        self, frames: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        bodies = self.kinematics.bodies(self.gen[frames])
+        return bodies.pos, bodies.quat, bodies.lin_vel, bodies.ang_vel
 
     def last_frame(self, frames: torch.Tensor) -> torch.Tensor:
         clip = torch.searchsorted(self.motion_ends, frames, right=True)
@@ -97,8 +84,7 @@ class MotionCommand:
             * self.goal_frame_stride
         )
         n = env.num_envs
-        # The frame that the next robot state is compared with.
-        self.time_steps = torch.zeros(n, dtype=torch.long, device=env.device)
+        self.set_time_steps(torch.zeros(n, dtype=torch.long, device=env.device))
         self.sampler: ResetSampler | None = ResetSampler(
             cfg.sampler, self.motion, env.dt, n, env.max_step_reward, env.device
         )
@@ -108,6 +94,16 @@ class MotionCommand:
         command.env = env
         command.sampler = None
         return command
+
+    def set_time_steps(self, time_steps: torch.Tensor) -> None:
+        self.time_steps = time_steps
+        # The tracked bodies' reference states at ``time_steps``, without env origins.
+        (
+            self._body_pos_w,
+            self._body_quat_w,
+            self._body_lin_vel_w,
+            self._body_ang_vel_w,
+        ) = self.motion.body_state(time_steps)
 
     # Reference at the current frames.
 
@@ -121,37 +117,35 @@ class MotionCommand:
 
     @property
     def body_pos_w(self) -> torch.Tensor:
-        pos = self.motion.bodies.pos[self.time_steps]
-        return pos + self.env.env_origins[:, None]
+        return self._body_pos_w + self.env.env_origins[:, None]
 
     @property
     def body_quat_w(self) -> torch.Tensor:
-        return self.motion.bodies.quat[self.time_steps]
+        return self._body_quat_w
 
     @property
     def body_lin_vel_w(self) -> torch.Tensor:
-        return self.motion.bodies.lin_vel[self.time_steps]
+        return self._body_lin_vel_w
 
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
-        return self.motion.bodies.ang_vel[self.time_steps]
+        return self._body_ang_vel_w
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
-        pos = self.motion.bodies.pos[self.time_steps, 0]
-        return pos + self.env.env_origins
+        return self._body_pos_w[:, 0] + self.env.env_origins
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:
-        return self.motion.bodies.quat[self.time_steps, 0]
+        return self._body_quat_w[:, 0]
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
-        return self.motion.bodies.lin_vel[self.time_steps, 0]
+        return self._body_lin_vel_w[:, 0]
 
     @property
     def anchor_ang_vel_w(self) -> torch.Tensor:
-        return self.motion.bodies.ang_vel[self.time_steps, 0]
+        return self._body_ang_vel_w[:, 0]
 
     @property
     def clip_end(self) -> torch.Tensor:
@@ -276,14 +270,15 @@ class MotionCommand:
                 clip_end,
                 truncated & ~clip_end,
             )
-        self.time_steps = torch.minimum(
-            time_steps + 1, self.motion.last_frame(time_steps)
+        self.set_time_steps(
+            torch.minimum(time_steps + 1, self.motion.last_frame(time_steps))
         )
 
     def reset(self, env_ids: torch.Tensor) -> None:
         assert self.sampler is not None, "Only the simulated env's command resets."
         frames = self.sampler.sample(len(env_ids))
-        self.time_steps = self.time_steps.index_copy(0, env_ids, frames + 1)
+        # Every env, so the forward kinematics keeps one batch size.
+        self.set_time_steps(self.time_steps.index_copy(0, env_ids, frames + 1))
         ref = self.motion.gen[frames]
 
         root_pos = ref.root_pos + self.env.env_origins[env_ids]
@@ -341,7 +336,7 @@ class MotionCommand:
         """Places envs exactly on the reference state of one frame, without the
         reset noise."""
         frames = torch.full_like(env_ids, frame)
-        self.time_steps = self.time_steps.index_copy(0, env_ids, frames + 1)
+        self.set_time_steps(self.time_steps.index_copy(0, env_ids, frames + 1))
         ref = self.motion.gen[frames]
         self._write_reference_state_to_sim(
             env_ids,

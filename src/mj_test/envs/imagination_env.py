@@ -114,7 +114,7 @@ class ImaginationEnv(Env):
         self.sim_ctx = sim_ctx.detach()
         self.env_origins = torch.zeros_like(gen.root_pos)
         self.robot = self._forward(gen)
-        self.command.time_steps = time_steps
+        self.command.set_time_steps(time_steps)
         self.action_term.action = prev_action.detach()
         self.action_term.prev_action = torch.zeros_like(prev_action)
         return self.observations()

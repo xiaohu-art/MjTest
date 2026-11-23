@@ -38,7 +38,7 @@ env:
   # ---- reference motion ----
   command:
     class_type: mj_test.mdp.command:MotionCommand
-    motion_file: /data/motion_data/datasets/lafan1/*.npz
+    motion_file: data/lafan1.npz
     body_names:  # Tracked bodies, anchor first.
       - pelvis
       - left_hip_roll_link
