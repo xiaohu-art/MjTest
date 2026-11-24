@@ -24,14 +24,15 @@ class Actor(nn.Module):
         proprio_dim: int,
         goal_dim: int,
         action_dim: int,
-        hidden_dims: tuple[int, ...],
+        encoder_dims: tuple[int, ...],
+        decoder_dims: tuple[int, ...],
     ) -> None:
         super().__init__()
         self.proprio_normalizer = EmpiricalNormalization(proprio_dim)
         self.goal_normalizer = EmpiricalNormalization(goal_dim)
-        self.encoder = build_mlp(goal_dim, hidden_dims, FSQ_SCALARS)
+        self.encoder = build_mlp(goal_dim, encoder_dims, FSQ_SCALARS)
         self.quantizer = IFSQ(FSQ_LEVELS)
-        self.decoder = build_mlp(FSQ_SCALARS + proprio_dim, hidden_dims, action_dim)
+        self.decoder = build_mlp(FSQ_SCALARS + proprio_dim, decoder_dims, action_dim)
 
     def forward(self, obs: TensorDict) -> torch.Tensor:
         """Computes the raw actions from the ``proprio`` and ``goal`` groups."""
@@ -51,12 +52,20 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    """Value function over critic observations."""
+    """Value function over the normalized critic observations."""
 
     def __init__(self, obs_dim: int, hidden_dims: tuple[int, ...]) -> None:
         super().__init__()
+        self.normalizer = EmpiricalNormalization(obs_dim)
         self.network = build_mlp(obs_dim, hidden_dims, 1)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         """Computes the values of shape (..., 1)."""
-        return self.network(obs)
+        return self.network(self.normalizer(obs))
+
+    def update_normalization(self, obs: TensorDict) -> None:
+        """Updates the input normalizer with real ``critic`` observations."""
+        x = obs["critic"]
+        self.normalizer.train()
+        self.normalizer.update(x.reshape(-1, x.shape[-1]))
+        self.normalizer.eval()

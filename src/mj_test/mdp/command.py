@@ -78,6 +78,9 @@ class MotionCommand:
         self.body_ids = torch.tensor(body_ids, dtype=torch.long, device=env.device)
         self.anchor_id = body_ids[0]
 
+        self.goal_body_names = tuple(cfg.goal_body_names)
+        self.goal_body_idx = [self.body_names.index(b) for b in self.goal_body_names]
+
         self.force_body_names = tuple(cfg.force.body_names)
         self.force_body_ids = self.entity.find_bodies(
             self.force_body_names, preserve_order=True
@@ -92,12 +95,14 @@ class MotionCommand:
             env.sim.mj_model, self.entity, self.body_names
         )
         self.motion = MotionLibrary(cfg.motion_file, kinematics, device=env.device)
+
         self.num_goal_frames = int(cfg.num_goal_frames)
         self.goal_frame_stride = int(cfg.goal_frame_stride)
-        self._goal_offsets = (
+        self.goal_offsets = (
             torch.arange(self.num_goal_frames, device=env.device)
             * self.goal_frame_stride
         )
+
         self.set_time_steps(torch.zeros(n, dtype=torch.long, device=env.device))
 
         self.sampler: ResetSampler | None = ResetSampler(
@@ -112,13 +117,17 @@ class MotionCommand:
 
     def set_time_steps(self, time_steps: torch.Tensor) -> None:
         self.time_steps = time_steps
-        # The tracked bodies' reference states at ``time_steps``, without env origins.
+
+        last = self.motion.last_frame(time_steps)
+        self.goal_frames = torch.minimum(
+            time_steps[:, None] + self.goal_offsets, last[:, None]
+        )
         (
             self._body_pos_w,
             self._body_quat_w,
             self._body_lin_vel_w,
             self._body_ang_vel_w,
-        ) = self.motion.body_state(time_steps)
+        ) = self.motion.body_state(self.goal_frames)
 
     # Reference at the current frames.
 
@@ -132,35 +141,35 @@ class MotionCommand:
 
     @property
     def body_pos_w(self) -> torch.Tensor:
-        return self._body_pos_w + self.env.env_origins[:, None]
+        return self._body_pos_w[:, 0] + self.env.env_origins[:, None]
 
     @property
     def body_quat_w(self) -> torch.Tensor:
-        return self._body_quat_w
-
-    @property
-    def body_lin_vel_w(self) -> torch.Tensor:
-        return self._body_lin_vel_w
-
-    @property
-    def body_ang_vel_w(self) -> torch.Tensor:
-        return self._body_ang_vel_w
-
-    @property
-    def anchor_pos_w(self) -> torch.Tensor:
-        return self._body_pos_w[:, 0] + self.env.env_origins
-
-    @property
-    def anchor_quat_w(self) -> torch.Tensor:
         return self._body_quat_w[:, 0]
 
     @property
-    def anchor_lin_vel_w(self) -> torch.Tensor:
+    def body_lin_vel_w(self) -> torch.Tensor:
         return self._body_lin_vel_w[:, 0]
 
     @property
-    def anchor_ang_vel_w(self) -> torch.Tensor:
+    def body_ang_vel_w(self) -> torch.Tensor:
         return self._body_ang_vel_w[:, 0]
+
+    @property
+    def anchor_pos_w(self) -> torch.Tensor:
+        return self._body_pos_w[:, 0, 0] + self.env.env_origins
+
+    @property
+    def anchor_quat_w(self) -> torch.Tensor:
+        return self._body_quat_w[:, 0, 0]
+
+    @property
+    def anchor_lin_vel_w(self) -> torch.Tensor:
+        return self._body_lin_vel_w[:, 0, 0]
+
+    @property
+    def anchor_ang_vel_w(self) -> torch.Tensor:
+        return self._body_ang_vel_w[:, 0, 0]
 
     @property
     def external_force_w(self) -> torch.Tensor:
@@ -219,9 +228,7 @@ class MotionCommand:
         Returns:
             shape (B, num_goal_frames * (2 * J + 9)).
         """
-        time_steps = self.time_steps
-        last = self.motion.last_frame(time_steps)
-        idx = torch.minimum(time_steps[:, None] + self._goal_offsets, last[:, None])
+        idx = self.goal_frames
         num_envs, num_frames = idx.shape
         ref = self.motion.gen[idx]
         robot = self.env.robot

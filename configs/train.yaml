@@ -54,6 +54,11 @@ env:
       - right_shoulder_roll_link
       - right_elbow_link
       - right_wrist_yaw_link
+    goal_body_names:
+      - left_wrist_yaw_link 
+      - right_wrist_yaw_link
+      - left_ankle_roll_link
+      - right_ankle_roll_link
     pose_range:
       x: [-0.05, 0.05]
       y: [-0.05, 0.05]
@@ -100,11 +105,13 @@ env:
     goal:
       terms:
         motion: { func: motion_goal }
+        body_error: { func: motion_body_error }
         force:  { func: force_command, params: { scale: 50.0 } }  # N
     critic:
       terms:
         state:   { func: robot_local_state }
         goal:    { func: motion_goal }
+        body_error: { func: motion_body_error }
         sim_ctx: { func: sim_ctx }
         force:   { func: force_command, params: { scale: 50.0 } }  # N
 
@@ -175,7 +182,9 @@ runner:
   save_interval: 1000
 
   dynamics: { hidden_dims: [2048, 2048, 2048] }
-  actor: { hidden_dims: [2048, 1024, 512, 256] }  # Encoder and decoder widths.
+  actor:
+    encoder_dims: [2048, 1024, 512, 256]
+    decoder_dims: [2048, 1024, 512, 256]
   critic: { hidden_dims: [256, 128] }
 
   wm:

@@ -3,6 +3,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from mjlab.utils.lab_api.math import (
+    matrix_from_quat,
+    quat_apply_inverse,
+    quat_inv,
+    quat_mul,
+)
 
 if TYPE_CHECKING:
     from mj_test.envs.env import Env
@@ -13,6 +19,7 @@ __all__ = [
     "joint_pos_rel",
     "joint_vel_rel",
     "last_action",
+    "motion_body_error",
     "motion_goal",
     "projected_gravity",
     "robot_local_state",
@@ -55,6 +62,26 @@ def last_action(env: Env) -> torch.Tensor:
 def motion_goal(env: Env) -> torch.Tensor:
     """Goal window of the motion command, shape (B, goal_dim)."""
     return env.command.goal()
+
+
+def motion_body_error(env: Env) -> torch.Tensor:
+    """Pose errors of the command's goal bodies over the goal window.
+    shape (B, num_goal_frames * K * 9).
+    """
+    cmd = env.command
+    idx = cmd.goal_body_idx
+    # The window caches are without env origins.
+    ref_pos = cmd._body_pos_w[:, :, idx] + env.env_origins[:, None, None]
+    ref_quat = cmd._body_quat_w[:, :, idx]
+    pos, quat = cmd.robot_body_pos_w[:, idx], cmd.robot_body_quat_w[:, idx]
+    root_quat = env.robot.root_link_quat_w[:, None, None].expand_as(ref_quat)
+    pos_error = quat_apply_inverse(root_quat, ref_pos - pos[:, None])
+    rot_error = quat_mul(quat_inv(quat)[:, None].expand_as(ref_quat), ref_quat)
+    rot_error = matrix_from_quat(rot_error)[..., :2]
+    num_envs = ref_pos.shape[0]
+    return torch.cat(
+        [pos_error.reshape(num_envs, -1), rot_error.reshape(num_envs, -1)], dim=-1
+    )
 
 
 def robot_local_state(env: Env) -> torch.Tensor:

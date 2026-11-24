@@ -65,16 +65,18 @@ class Runner:
             delta_dim(gen),
             env.action_term,
             KinematicModel.from_entity(
-                env.sim.mj_model, 
-                env.entity, 
-                command.force_body_names
+                env.sim.mj_model, env.entity, command.force_body_names
             ),
             dt=env.dt,
             substep_coeff=(decimation + 1) / (2 * decimation),
             hidden_dims=tuple(cfg.dynamics.hidden_dims),
         ).to(self.device)
         self.actor = Actor(
-            proprio_dim, goal_dim, action_dim, tuple(cfg.actor.hidden_dims)
+            proprio_dim,
+            goal_dim,
+            action_dim,
+            tuple(cfg.actor.encoder_dims),
+            tuple(cfg.actor.decoder_dims),
         ).to(self.device)
         self.critic = Critic(
             self.obs["critic"].shape[-1], tuple(cfg.critic.hidden_dims)
@@ -183,6 +185,7 @@ class Runner:
         )
         self.wm_learner.update_normalization(gen, action)
         self.actor.update_normalization(obs)
+        self.critic.update_normalization(obs)
 
     def save(self) -> None:
         """Saves the training state to ``model_<iteration>.pt`` in the log
