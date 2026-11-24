@@ -85,6 +85,9 @@ class MotionCommand:
         self.force_magnitude_range = tuple(float(v) for v in cfg.force.magnitude_range)
         self.force_cmd = torch.zeros(n, len(self.force_body_ids), 3, device=env.device)
 
+        # Upper bound of the sampled magnitude.
+        self.force_max = self.force_magnitude_range[1]
+
         kinematics = KinematicModel.from_entity(
             env.sim.mj_model, self.entity, self.body_names
         )
@@ -358,8 +361,9 @@ class MotionCommand:
         device = self.force_cmd.device
         direction = torch.randn(shape, device=device)
         direction = direction / direction.norm(dim=-1, keepdim=True)
-        lo, hi = self.force_magnitude_range
-        return direction * sample_uniform(lo, hi, (*shape[:2], 1), device=device)
+        lo = self.force_magnitude_range[0]
+        magnitude = sample_uniform(lo, self.force_max, (*shape[:2], 1), device=device)
+        return direction * magnitude
 
     def _write_external_force(
         self, env_ids: torch.Tensor | None, root_quat: torch.Tensor

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from mj_test.envs.sim_env import SimEnv
 
 _DESIRED_FRAME_COLORS = ((1.0, 0.5, 0.5), (0.5, 1.0, 0.5), (0.5, 0.5, 1.0))
+_FORCE_COLOR = (1.0, 0.55, 0.0, 1.0)
 
 
 class _RewardTerms:
@@ -57,12 +58,14 @@ class _NoTerms:
 
 
 class _MotionReference:
-    """Reference motion drawing and frame controls, in the form of a command manager.
+    """Reference motion and force command drawing and frame controls, in the form
+    of a command manager.
 
     Args:
         env: The simulated env.
         mode: Draw the reference as a ghost robot or as body frames.
         ghost_color: RGBA color of the ghost robot.
+        force_length: Arrow length per newton of the force command, in m.
     """
 
     active_terms = ["motion"]
@@ -72,18 +75,26 @@ class _MotionReference:
         env: SimEnv,
         mode: Literal["ghost", "frames"],
         ghost_color: tuple[float, float, float, float],
+        force_length: float,
     ) -> None:
         self.env = env
         self.mode = mode
+        self.force_length = force_length
+        self.show_force = True
         self.ghost_color = np.array(ghost_color, dtype=np.float32)
         self.enabled = True
         self._ghost_model = None
         self._scrubber_handles: tuple[Any, ...] = ()
 
     def debug_vis(self, visualizer: DebugVisualizer) -> None:
-        """Draws the reference of the frame that each shown env tracks."""
+        """Draws the reference of the frame that each shown env tracks, and the
+        force command."""
         env_indices = visualizer.get_env_indices(self.env.num_envs)
-        if not self.enabled or not env_indices:
+        if not env_indices:
+            return
+        if self.show_force:
+            self._draw_forces(visualizer, env_indices)
+        if not self.enabled:
             return
         env = self.env
         cmd = env.command
@@ -121,6 +132,25 @@ class _MotionReference:
                     rotation_matrix=robot_rot[i, j],
                     scale=0.12,
                     label=f"current_{name}_{i}",
+                )
+
+    def _draw_forces(
+        self, visualizer: DebugVisualizer, env_indices: Sequence[int]
+    ) -> None:
+        """Draws the force that each force body must exert as an arrow from its CoM,
+        the opposite of the external force that the simulator applies there."""
+        cmd = self.env.command
+        start = self.env.robot.body_com_pos_w[:, cmd.force_body_ids].cpu().numpy()
+        force = (-cmd.external_force_w).cpu().numpy()
+        for i in env_indices:
+            for j, name in enumerate(cmd.force_body_names):
+                if np.linalg.norm(force[i, j]) < 1e-3:
+                    continue
+                visualizer.add_arrow(
+                    start[i, j],
+                    start[i, j] + self.force_length * force[i, j],
+                    color=_FORCE_COLOR,
+                    label=f"force_{name}_{i}",
                 )
 
     def create_gui(
@@ -163,12 +193,20 @@ class _MotionReference:
     def create_debug_vis_gui(
         self, server: viser.ViserServer, on_change: Callable[[], None] | None = None
     ) -> None:
-        """Adds the checkbox that shows or hides the reference."""
+        """Adds the checkboxes that show or hide the reference and the force command."""
         checkbox = server.gui.add_checkbox("Motion", initial_value=self.enabled)
 
         @checkbox.on_update
         def _(_) -> None:
             self.enabled = checkbox.value
+            if on_change is not None:
+                on_change()
+
+        force = server.gui.add_checkbox("Force", initial_value=self.show_force)
+
+        @force.on_update
+        def _(_) -> None:
+            self.show_force = force.value
             if on_change is not None:
                 on_change()
 
@@ -205,6 +243,7 @@ class ViewerEnv:
         env: The simulated env.
         mode: Draw the reference as a ghost robot or as body frames.
         ghost_color: RGBA color of the ghost robot.
+        force_length: Arrow length per newton of the force command, in m.
     """
 
     def __init__(
@@ -212,12 +251,13 @@ class ViewerEnv:
         env: SimEnv,
         mode: Literal["ghost", "frames"] = "ghost",
         ghost_color: tuple[float, float, float, float] = (0.5, 0.7, 0.5, 0.5),
+        force_length: float = 0.01,
     ) -> None:
         self.env = env
         self.cfg = SimpleNamespace(viewer=env.viewer_cfg)
         self.reward_manager = _RewardTerms(env)
         self.metrics_manager = _NoTerms()
-        self.command_manager = _MotionReference(env, mode, ghost_color)
+        self.command_manager = _MotionReference(env, mode, ghost_color, force_length)
         env.sim.forward()
 
     @property
@@ -267,7 +307,7 @@ class ViewerEnv:
         return self.env.reset(env_ids)
 
     def update_visualizers(self, visualizer: DebugVisualizer) -> None:
-        """Draws the reference motion."""
+        """Draws the reference motion and the force command."""
         self.command_manager.debug_vis(visualizer)
 
     def close(self) -> None:

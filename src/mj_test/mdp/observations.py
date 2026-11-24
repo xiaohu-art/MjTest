@@ -30,9 +30,10 @@ def base_ang_vel(env: Env) -> torch.Tensor:
     return env.robot.root_link_ang_vel_b
 
 
-def force_command(env: Env) -> torch.Tensor:
-    """Force that each force body must exert, in the heading frame, (B, 3 * K)."""
-    return env.command.force_cmd.flatten(1)
+def force_command(env: Env, scale: float) -> torch.Tensor:
+    """Force that each force body must exert, in the heading frame, divided by the
+    fixed ``scale`` (N), (B, 3 * K)."""
+    return env.command.force_cmd.flatten(1) / scale
 
 
 def joint_pos_rel(env: Env) -> torch.Tensor:

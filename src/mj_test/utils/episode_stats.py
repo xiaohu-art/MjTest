@@ -24,7 +24,7 @@ class EpisodeStats:
         self.rewards = rewards
         self.dt = dt
         self.episode_length_s = episode_length_s
-        self._episode_return = torch.zeros(num_envs, device=device)
+        self.episode_return = torch.zeros(num_envs, device=device)
         self._episode_sums = {
             name: torch.zeros(num_envs, device=device) for name in rewards
         }
@@ -51,22 +51,26 @@ class EpisodeStats:
     ) -> None:
         sums = self._sums
         ended = ended.float()
-        self._episode_return += reward
+        self.episode_return += reward
         sums["steps"] += 1.0
         sums["episodes"] += ended.sum()
-        sums["Episode/return"] += (self._episode_return * ended).sum()
+        sums["Episode/return"] += (self.episode_return * ended).sum()
         sums["Episode/length"] += (episode_length * ended).sum()
-        self._episode_return *= 1.0 - ended
         for name, term in self.rewards.items():
             episode = self._episode_sums[name]
             episode += terms[name] * term.weight * self.dt
             per_second = (episode * ended).sum() / self.episode_length_s
             sums[f"Episode_Reward/{name}"] += per_second
-            episode *= 1.0 - ended
         for name, flag in reasons.items():
             sums[f"Episode_Termination/{name}"] += (flag * ended).sum()
         for name, metric in env.command.metrics().items():
             sums[name] += metric.mean()
+
+    def reset(self, env_ids: torch.Tensor) -> None:
+        """Starts new episodes, after the curriculum has read the ended ones."""
+        self.episode_return[env_ids] = 0.0
+        for episode in self._episode_sums.values():
+            episode[env_ids] = 0.0
 
     def pop(self) -> dict[str, float]:
         sums = {key: float(value) for key, value in self._sums.items()}

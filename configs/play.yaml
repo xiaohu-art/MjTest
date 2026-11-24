@@ -10,6 +10,8 @@ env:
   observations:
     proprio:
       enable_noise: false
+  curriculum:
+    force: null  # The full force range.
   command:
     pose_range: null
     velocity_range: null

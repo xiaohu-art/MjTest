@@ -70,8 +70,10 @@ env:
       yaw: [-0.78, 0.78]
     joint_position_range: [-0.1, 0.1]
     force:
-      body_names: [left_wrist_yaw_link, right_wrist_yaw_link]
-      magnitude_range: [0.0, 40.0]  # N, uniform; direction uniform.
+      body_names: [
+        left_wrist_yaw_link, right_wrist_yaw_link,
+      ]
+      magnitude_range: [0.0, 50.0]  # N
     num_goal_frames: 10
     goal_frame_stride: 5
     sampler:
@@ -98,13 +100,13 @@ env:
     goal:
       terms:
         motion: { func: motion_goal }
-        force:  { func: force_command }
+        force:  { func: force_command, params: { scale: 50.0 } }  # N
     critic:
       terms:
         state:   { func: robot_local_state }
         goal:    { func: motion_goal }
         sim_ctx: { func: sim_ctx }
-        force:   { func: force_command }
+        force:   { func: force_command, params: { scale: 50.0 } }  # N
 
   # ---- reward weights & params ----
   rewards:
@@ -122,6 +124,16 @@ env:
     motion_end: { func: motion_end, time_out: true }
     anchor_pos: { func: anchor_height_error, threshold: 0.25 }
     anchor_ori: { func: anchor_tilt_error, threshold: 0.8 }
+
+  # ---- curriculum ----
+  curriculum:
+    force:
+      func: force_levels
+      params:
+        initial_max: 10.0  # N
+        step: 5.0
+        interval: 500
+        promote_ratio: 0.75
 
   # ---- domain randomization ----
   events:

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import importlib
 import math
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 import mujoco_warp as mjwarp
@@ -23,6 +24,7 @@ from mjlab.viewer.viewer_config import ViewerConfig
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 
+from mj_test import mdp
 from mj_test.envs.env import Env
 from mj_test.mdp.action import JointPositionAction
 from mj_test.utils.episode_stats import EpisodeStats
@@ -45,6 +47,12 @@ class QuietSimulationCfg(SimulationCfg):
         wp_opt.warn_overflow &= ~int(
             mjwarp.OverflowType.ITERATIONS | mjwarp.OverflowType.LS_ITERATIONS
         )
+
+
+@dataclass
+class CurriculumTerm:
+    func: Callable[..., dict[str, float]]
+    params: dict[str, Any] = field(default_factory=dict)
 
 
 class SimEnv(Env):
@@ -124,9 +132,20 @@ class SimEnv(Env):
         self.reward_buf = torch.zeros(n, device=device)
         self.reset_terminated = torch.zeros(n, dtype=torch.bool, device=device)
         self.reset_time_outs = torch.zeros(n, dtype=torch.bool, device=device)
+        self.common_step_counter = 0
 
         self.command = _import(cfg.command.class_type)(cfg.command, self)
-        self.reset()
+
+        self.curriculum: dict[str, CurriculumTerm] = {}
+        for name, term in cfg.curriculum.items():
+            if term is None:
+                continue
+            func, params = getattr(mdp, term.func), dict(term.get("params", {}))
+            if isinstance(func, type):
+                func = func(self, **params)
+            self.curriculum[name] = CurriculumTerm(func, params)
+        self._curriculum_state: dict[str, dict[str, float]] = {}
+
         self.stats = EpisodeStats(
             self.rewards,
             tuple(self.terminations),
@@ -136,6 +155,7 @@ class SimEnv(Env):
             cfg.episode_length_s,
             device,
         )
+        self.reset()
 
     @property
     def num_envs(self) -> int:
@@ -173,6 +193,7 @@ class SimEnv(Env):
             self.scene.update(dt=self.physics_dt)
         self.sim.forward()  # The rewards and terminations read the step's end.
         self.episode_length_buf += 1
+        self.common_step_counter += 1
 
         self.reward_buf, terms, errors = self._post_step()
         time_outs = self._time_outs()
@@ -215,18 +236,24 @@ class SimEnv(Env):
         return self.observations(), {}
 
     def pop_log(self) -> dict[str, float]:
-        return self.stats.pop() | self.command.log()
+        log = self.stats.pop() | self.command.log()
+        for name, state in self._curriculum_state.items():
+            log |= {f"Curriculum/{name}/{key}": v for key, v in state.items()}
+        return log
 
     def close(self) -> None:
         """Releases the env."""
 
     def _reset_idx(self, env_ids: torch.Tensor) -> None:
+        for name, term in self.curriculum.items():
+            self._curriculum_state[name] = term.func(self, env_ids, **term.params)
         self.sim.reset(env_ids)
         self.scene.reset(env_ids)
         self.action_term.reset(env_ids)
         self.command.reset(env_ids)
         self.scene.write_data_to_sim(env_ids=env_ids)
         self.episode_length_buf[env_ids] = 0
+        self.stats.reset(env_ids)
 
 
 def _any(flags: list[torch.Tensor], like: torch.Tensor) -> torch.Tensor:
