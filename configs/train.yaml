@@ -69,6 +69,9 @@ env:
       pitch: [-0.52, 0.52]
       yaw: [-0.78, 0.78]
     joint_position_range: [-0.1, 0.1]
+    force:
+      body_names: [left_wrist_yaw_link, right_wrist_yaw_link]
+      magnitude_range: [0.0, 40.0]  # N, uniform; direction uniform.
     num_goal_frames: 10
     goal_frame_stride: 5
     sampler:
@@ -95,11 +98,13 @@ env:
     goal:
       terms:
         motion: { func: motion_goal }
+        force:  { func: force_command }
     critic:
       terms:
         state:   { func: robot_local_state }
         goal:    { func: motion_goal }
         sim_ctx: { func: sim_ctx }
+        force:   { func: force_command }
 
   # ---- reward weights & params ----
   rewards:

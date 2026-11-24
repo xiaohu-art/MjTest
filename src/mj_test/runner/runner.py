@@ -19,7 +19,7 @@ from mj_test.mdp.command import MotionCommand
 from mj_test.policy.learner import ActorCriticPolicyLearner
 from mj_test.policy.networks import Actor, Critic
 from mj_test.runner.replay_buffer import ReplayBuffer
-from mj_test.utils.forward_kinematics import GenCoords
+from mj_test.utils.forward_kinematics import GenCoords, KinematicModel
 from mj_test.wm.dynamics import Dynamics
 from mj_test.wm.learner import WorldModelLearner
 from mj_test.wm.representation import delta_dim, local_state
@@ -58,11 +58,17 @@ class Runner:
         action_dim = env.action_term.dim
         decimation = env.decimation
 
+        command = cast(MotionCommand, env.command)
         self.dynamics = Dynamics(
             state_dim,
             sim_ctx_dim,
             delta_dim(gen),
             env.action_term,
+            KinematicModel.from_entity(
+                env.sim.mj_model, 
+                env.entity, 
+                command.force_body_names
+            ),
             dt=env.dt,
             substep_coeff=(decimation + 1) / (2 * decimation),
             hidden_dims=tuple(cfg.dynamics.hidden_dims),
@@ -76,12 +82,13 @@ class Runner:
 
         done = torch.zeros(env.num_envs, dtype=torch.bool, device=self.device)
         action = env.action_term.action
-        time_steps = cast(MotionCommand, env.command).time_steps
         row = TensorDict(
             {
                 "gen": gen,
                 "sim_ctx": env.sim_ctx,
-                "time_steps": time_steps,
+                "time_steps": command.time_steps,
+                "force_cmd": command.force_cmd,
+                "force": command.external_force_w,
                 "prev_action": action,
                 "action": action,
                 "terminated": done,
@@ -148,7 +155,10 @@ class Runner:
         env = self.env
         gen = GenCoords.from_entity(env.entity, env.env_origins)
         sim_ctx = env.sim_ctx
-        time_steps = cast(MotionCommand, env.command).time_steps
+        command = cast(MotionCommand, env.command)
+        time_steps = command.time_steps
+        force_cmd = command.force_cmd
+        force = command.external_force_w  # Applied in the simulation this step.
         prev_action = env.action_term.action
         obs = self.obs
         action = self.actor(obs)
@@ -161,6 +171,8 @@ class Runner:
                     "gen": gen,
                     "sim_ctx": sim_ctx,
                     "time_steps": time_steps,
+                    "force_cmd": force_cmd,
+                    "force": force,
                     "prev_action": prev_action,
                     "action": action,
                     "terminated": terminated & ~truncated,  # Falls only.

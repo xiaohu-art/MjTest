@@ -159,7 +159,11 @@ class ActorCriticPolicyLearner:
             ``done``, and the observations after the last step.
         """
         obs = self.imagination.reset(
-            start["gen"], start["sim_ctx"], start["time_steps"], start["prev_action"]
+            start["gen"],
+            start["sim_ctx"],
+            start["time_steps"],
+            start["force_cmd"],
+            start["prev_action"],
         )
         steps = []
         for _ in range(self.cfg.horizon):

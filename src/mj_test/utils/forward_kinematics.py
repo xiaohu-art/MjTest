@@ -158,6 +158,10 @@ class ForwardKinematics:
                     ]
                 )
         self.consts = torch.as_tensor(consts, device=device, dtype=dtype)
+        self.com_offset = torch.as_tensor(
+            mj_model.body_ipos[rows], device=device, dtype=dtype
+        )
+        self.num_joints = len(col_of)
         by_step = [[steps[s] for s in path] for path in zip(*paths, strict=True)]
         self.col = torch.tensor([[s[1] for s in d] for d in by_step], device=device)
         self.qpos0 = torch.tensor(
@@ -184,29 +188,16 @@ class ForwardKinematics:
         joint_pos, joint_vel = (
             torch.nn.functional.pad(x, (0, 1)) for x in (joint_pos, joint_vel)
         )
-        zero, one = root_pos.new_zeros(()), root_pos.new_ones(())
-        pos: Vec = (zero, zero, zero)
-        quat: Vec = (one, zero, zero, zero)
+        pos, quat, hinges = self._chain(joint_pos)
+        zero = root_pos.new_zeros(())
         lin: Vec = (zero, zero, zero)
         ang: Vec = (zero, zero, zero)
-        for col, qpos0, consts in zip(self.col, self.qpos0, self.consts, strict=True):
-            c = consts.unbind(-1)
-            half = (joint_pos[..., col] - qpos0) / 2
-            # The hinge anchor and twist in the root frame, from the parent's pose.
-            anchor = _add(pos, _rotate(quat, c[:3]))
-            twist = tuple(a * joint_vel[..., col] for a in _rotate(quat, c[3:6]))
-            turn = tuple(
-                half.cos() * o + half.sin() * t
-                for o, t in zip(c[9:13], c[13:], strict=True)
-            )
-            quat = _mul(quat, turn)
-            pos = _sub(anchor, _rotate(quat, c[6:9]))
+        for col, anchor, axis in hinges:
+            twist = tuple(a * joint_vel[..., col] for a in axis)
             ang = _add(ang, twist)
             lin = _add(lin, _cross(anchor, twist))
 
-        w, x, y, z = root_quat.unsqueeze(-2).unbind(-1)
-        norm = (w * w + x * x + y * y + z * z).sqrt()
-        root = (w / norm, x / norm, y / norm, z / norm)
+        root = _unit(root_quat.unsqueeze(-2).unbind(-1))
         pos = _rotate(root, pos)
         ang = _add(root_ang_vel.unsqueeze(-2).unbind(-1), _rotate(root, ang))
         lin = _add(root_lin_vel.unsqueeze(-2).unbind(-1), _rotate(root, lin))
@@ -215,6 +206,64 @@ class ForwardKinematics:
         state = torch.stack([*pos, *_mul(root, quat), *lin, *ang], dim=-1)
         pos_w, quat_w, lin_vel_w, ang_vel_w = state.split((3, 4, 3, 3), dim=-1)
         return pos_w, quat_w, lin_vel_w, ang_vel_w
+
+    def generalized_force(
+        self, root_quat: torch.Tensor, joint_pos: torch.Tensor, force_w: torch.Tensor
+    ) -> torch.Tensor:
+        """``J(q)ᵀ F`` of world-frame forces ``(..., R, 3)`` at the CoMs of the R
+        bodies, where MuJoCo applies ``xfrc_applied``.
+
+        Returns:
+            The root force and the root torque about the root origin, both in the
+            root frame, then the joint torques, summed over the bodies, (..., 6 + J).
+        """
+        pos, quat, hinges = self._chain(torch.nn.functional.pad(joint_pos, (0, 1)))
+        point = _add(pos, _rotate(quat, self.com_offset.unbind(-1)))
+        force = _rotate(
+            _conj(_unit(root_quat.unsqueeze(-2).unbind(-1))), force_w.unbind(-1)
+        )
+        # A hinge's torque is its axis times the moment of the force about its anchor.
+        torque = torch.stack(
+            [
+                _dot(axis, _cross(_sub(point, anchor), force))
+                for _, anchor, axis in hinges
+            ],
+            dim=-2,
+        )
+        joint = torque.new_zeros(*torque.shape[:-2], self.num_joints + 1).index_add(
+            -1, self.col.flatten(), torque.flatten(-2)
+        )
+        return torch.cat(
+            [
+                torch.stack(force, dim=-1).sum(-2),
+                torch.stack(_cross(point, force), dim=-1).sum(-2),
+                joint[..., :-1],
+            ],
+            dim=-1,
+        )
+
+    def _chain(
+        self, joint_pos: torch.Tensor
+    ) -> tuple[Vec, Vec, list[tuple[torch.Tensor, Vec, Vec]]]:
+        """Walks the paths in the root frame."""
+        zero, one = joint_pos.new_zeros(()), joint_pos.new_ones(())
+        pos: Vec = (zero, zero, zero)
+        quat: Vec = (one, zero, zero, zero)
+        hinges = []
+        for col, qpos0, consts in zip(self.col, self.qpos0, self.consts, strict=True):
+            c = consts.unbind(-1)
+            half = (joint_pos[..., col] - qpos0) / 2
+            # The hinge anchor and axis in the root frame, from the parent's pose.
+            anchor = _add(pos, _rotate(quat, c[:3]))
+            axis = _rotate(quat, c[3:6])
+            turn = tuple(
+                half.cos() * o + half.sin() * t
+                for o, t in zip(c[9:13], c[13:], strict=True)
+            )
+            quat = _mul(quat, turn)
+            pos = _sub(anchor, _rotate(quat, c[6:9]))
+            hinges.append((col, anchor, axis))
+        return pos, quat, hinges
 
 
 class KinematicModel:
@@ -225,6 +274,8 @@ class KinematicModel:
         body_names: Output bodies.
         default_joint_pos: Default joint positions, shape (J,).
         joint_limits: Lower and upper soft joint position limits, shape (J, 2).
+        effort_limits: Actuator torque limit of each joint, shape (J,).
+        mass: Total mass of the robot in kg.
     """
 
     def __init__(
@@ -233,11 +284,15 @@ class KinematicModel:
         body_names: tuple[str, ...],
         default_joint_pos: torch.Tensor,
         joint_limits: torch.Tensor,
+        effort_limits: torch.Tensor,
+        mass: float,
     ) -> None:
         self.fk = fk
         self.body_names = body_names
         self.default_joint_pos = default_joint_pos
         self.joint_limits = joint_limits
+        self.effort_limits = effort_limits
+        self.mass = mass
 
     @classmethod
     def from_entity(
@@ -273,6 +328,8 @@ class KinematicModel:
             tuple(body_names),
             default_joint_pos=data.default_joint_pos[0].clone(),
             joint_limits=data.soft_joint_pos_limits[0].clone(),
+            effort_limits=_effort_limits(mj_model, entity),
+            mass=float(mj_model.body_subtreemass[int(indexing.body_ids[0])]),
         )
 
     @torch.compile
@@ -293,6 +350,38 @@ class KinematicModel:
             batch_size=(*gen.batch_size, len(self.body_names)),
         )
 
+    @torch.compile
+    def generalized_force(self, gen: GenCoords, force_w: torch.Tensor) -> torch.Tensor:
+        """``J(q)ᵀ F`` of world-frame forces ``(..., K, 3)`` at the CoMs of the K
+        bodies: the root force and torque in the root frame, then the joint torques,
+        (..., 6 + J)."""
+        return self.fk.generalized_force(gen.root_quat, gen.joint_pos, force_w)
+
+
+def _effort_limits(mj_model: mujoco.MjModel, entity: Entity) -> torch.Tensor:
+    """The torque limit of each entity joint, from the joint's actuator force range
+    or its actuators' force ranges, (J,)."""
+    actuated: dict[int, float] = {}
+    for a in range(mj_model.nu):
+        if (
+            mj_model.actuator_trntype[a] == mujoco.mjtTrn.mjTRN_JOINT
+            and mj_model.actuator_forcelimited[a]
+        ):
+            joint = int(mj_model.actuator_trnid[a, 0])
+            limit = float(np.abs(mj_model.actuator_forcerange[a]).max())
+            actuated[joint] = max(actuated.get(joint, 0.0), limit)
+    limits = []
+    for joint, name in zip(
+        entity.indexing.joint_ids.tolist(), entity.joint_names, strict=True
+    ):
+        if mj_model.jnt_actfrclimited[joint]:
+            limits.append(float(np.abs(mj_model.jnt_actfrcrange[joint]).max()))
+        elif joint in actuated:
+            limits.append(actuated[joint])
+        else:
+            raise ValueError(f"joint {name} has no actuator torque limit")
+    return torch.tensor(limits, device=entity.data.device)
+
 
 def _add(a: Vec, b: Vec) -> Vec:
     return tuple(x + y for x, y in zip(a, b, strict=True))
@@ -308,6 +397,20 @@ def _cross(a: Vec, b: Vec) -> Vec:
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     )
+
+
+def _dot(a: Vec, b: Vec) -> torch.Tensor:
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _unit(q: Vec) -> Vec:
+    w, x, y, z = q
+    norm = (w * w + x * x + y * y + z * z).sqrt()
+    return (w / norm, x / norm, y / norm, z / norm)
+
+
+def _conj(q: Vec) -> Vec:
+    return (q[0], -q[1], -q[2], -q[3])
 
 
 def _rotate(q: Vec, v: Vec) -> Vec:

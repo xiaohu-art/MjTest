@@ -52,7 +52,7 @@ class WorldModelLearner:
     def _update_batch(self, td: TensorDict) -> dict[str, torch.Tensor]:
         """Runs one gradient step on one batch of windows."""
         states = td["gen"]
-        pred = self._rollout(states, td["action"], td["sim_ctx"][:, 0])
+        pred = self._rollout(states, td["action"], td["sim_ctx"][:, 0], td["force"])
         target = states[:, 1:]
         loss, block_mse = self._losses(pred, target)
         optimize_step(self.optimizers, loss, self._params, self.cfg.max_grad_norm)
@@ -60,7 +60,11 @@ class WorldModelLearner:
 
     @torch.compile
     def _rollout(
-        self, states: GenCoords, actions: torch.Tensor, sim_ctx: torch.Tensor
+        self,
+        states: GenCoords,
+        actions: torch.Tensor,
+        sim_ctx: torch.Tensor,
+        forces: torch.Tensor,
     ) -> GenCoords:
         """Rolls the dynamics out from the first frame with the window's actions.
 
@@ -68,6 +72,7 @@ class WorldModelLearner:
             states: Real states of shape (batch_size, horizon, ...).
             actions: Raw actions of shape (batch_size, horizon, action_dim).
             sim_ctx: Sim context of shape (batch_size, sim_ctx_dim).
+            forces: World-frame external forces of shape (batch_size, horizon, K, 3).
 
         Returns:
             Predicted states of shape (batch_size, horizon - 1, ...).
@@ -75,7 +80,7 @@ class WorldModelLearner:
         state = states[:, 0]
         preds: list[GenCoords] = []
         for k in range(actions.shape[1] - 1):
-            state = self.dynamics(state, actions[:, k], sim_ctx)
+            state = self.dynamics(state, actions[:, k], sim_ctx, forces[:, k])
             preds.append(state)
         return torch.stack(preds, dim=1)
 

@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "base_ang_vel",
+    "force_command",
     "joint_pos_rel",
     "joint_vel_rel",
     "last_action",
@@ -27,6 +28,11 @@ def projected_gravity(env: Env) -> torch.Tensor:
 def base_ang_vel(env: Env) -> torch.Tensor:
     """Root angular velocity in the root frame, shape (B, 3)."""
     return env.robot.root_link_ang_vel_b
+
+
+def force_command(env: Env) -> torch.Tensor:
+    """Force that each force body must exert, in the heading frame, (B, 3 * K)."""
+    return env.command.force_cmd.flatten(1)
 
 
 def joint_pos_rel(env: Env) -> torch.Tensor:

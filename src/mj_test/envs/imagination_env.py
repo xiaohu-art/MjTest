@@ -106,6 +106,7 @@ class ImaginationEnv(Env):
         gen: GenCoords,
         sim_ctx: torch.Tensor,
         time_steps: torch.Tensor,
+        force_cmd: torch.Tensor,
         prev_action: torch.Tensor,
     ) -> TensorDict:
         """Starts imagined rollouts from real transitions."""
@@ -115,6 +116,7 @@ class ImaginationEnv(Env):
         self.env_origins = torch.zeros_like(gen.root_pos)
         self.robot = self._forward(gen)
         self.command.set_time_steps(time_steps)
+        self.command.force_cmd = force_cmd
         self.action_term.action = prev_action.detach()
         self.action_term.prev_action = torch.zeros_like(prev_action)
         return self.observations()
@@ -124,7 +126,12 @@ class ImaginationEnv(Env):
         self, action: torch.Tensor
     ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """Advances the imagined rollouts by one step."""
-        gen = self.dynamics(self.robot.gen, action, self.sim_ctx)
+        gen = self.dynamics(
+            self.robot.gen, 
+            action, 
+            self.sim_ctx, 
+            self.command.external_force_w
+        )
         self.robot = self._forward(gen)
         self.action_term.process(action)
         reward, terms, errors = self._post_step()

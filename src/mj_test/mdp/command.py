@@ -7,11 +7,13 @@ import numpy as np
 import torch
 from mjlab.utils.lab_api.math import (
     matrix_from_quat,
+    quat_apply,
     quat_error_magnitude,
     quat_from_euler_xyz,
     quat_mul,
     sample_uniform,
     subtract_frame_transforms,
+    yaw_quat,
 )
 from omegaconf import DictConfig
 
@@ -68,10 +70,20 @@ class MotionCommand:
         self.cfg = cfg
         self.env: Env = env
         self.entity = env.entity
+
+        n = env.num_envs
+
         self.body_names = tuple(cfg.body_names)  # Anchor first.
         body_ids = self.entity.find_bodies(self.body_names, preserve_order=True)[0]
         self.body_ids = torch.tensor(body_ids, dtype=torch.long, device=env.device)
         self.anchor_id = body_ids[0]
+
+        self.force_body_names = tuple(cfg.force.body_names)
+        self.force_body_ids = self.entity.find_bodies(
+            self.force_body_names, preserve_order=True
+        )[0]
+        self.force_magnitude_range = tuple(float(v) for v in cfg.force.magnitude_range)
+        self.force_cmd = torch.zeros(n, len(self.force_body_ids), 3, device=env.device)
 
         kinematics = KinematicModel.from_entity(
             env.sim.mj_model, self.entity, self.body_names
@@ -83,8 +95,8 @@ class MotionCommand:
             torch.arange(self.num_goal_frames, device=env.device)
             * self.goal_frame_stride
         )
-        n = env.num_envs
         self.set_time_steps(torch.zeros(n, dtype=torch.long, device=env.device))
+
         self.sampler: ResetSampler | None = ResetSampler(
             cfg.sampler, self.motion, env.dt, n, env.max_step_reward, env.device
         )
@@ -146,6 +158,10 @@ class MotionCommand:
     @property
     def anchor_ang_vel_w(self) -> torch.Tensor:
         return self._body_ang_vel_w[:, 0]
+
+    @property
+    def external_force_w(self) -> torch.Tensor:
+        return heading_to_world(self.robot_anchor_quat_w, -self.force_cmd)
 
     @property
     def clip_end(self) -> torch.Tensor:
@@ -270,6 +286,7 @@ class MotionCommand:
                 clip_end,
                 truncated & ~clip_end,
             )
+            self._write_external_force(None, env.robot.root_link_quat_w)
         self.set_time_steps(
             torch.minimum(time_steps + 1, self.motion.last_frame(time_steps))
         )
@@ -331,6 +348,30 @@ class MotionCommand:
             joint_pos,
             joint_vel,
         )
+        self.force_cmd = self.force_cmd.index_copy(
+            0, env_ids, self._sample_force(len(env_ids))
+        )
+        self._write_external_force(env_ids, root_ori)
+
+    def _sample_force(self, num: int) -> torch.Tensor:
+        shape = (num, len(self.force_body_ids), 3)
+        device = self.force_cmd.device
+        direction = torch.randn(shape, device=device)
+        direction = direction / direction.norm(dim=-1, keepdim=True)
+        lo, hi = self.force_magnitude_range
+        return direction * sample_uniform(lo, hi, (*shape[:2], 1), device=device)
+
+    def _write_external_force(
+        self, env_ids: torch.Tensor | None, root_quat: torch.Tensor
+    ) -> None:
+        force_cmd = self.force_cmd if env_ids is None else self.force_cmd[env_ids]
+        force_w = heading_to_world(root_quat, -force_cmd)
+        self.entity.write_external_wrench_to_sim(
+            force_w,
+            torch.zeros_like(force_w),
+            env_ids=env_ids,
+            body_ids=self.force_body_ids,
+        )
 
     def reset_to_frame(self, env_ids: torch.Tensor, frame: int) -> None:
         """Places envs exactly on the reference state of one frame, without the
@@ -347,6 +388,7 @@ class MotionCommand:
             ref.joint_pos,
             ref.joint_vel,
         )
+        self._write_external_force(env_ids, ref.root_quat)
 
     def log(self) -> dict[str, float]:
         return {} if self.sampler is None else self.sampler.log()
@@ -376,3 +418,10 @@ class MotionCommand:
         root_state = torch.cat([root_pos, root_ori, root_lin_vel, root_ang_vel], dim=-1)
         self.entity.write_root_state_to_sim(root_state, env_ids=env_ids)
         self.entity.reset(env_ids=env_ids)
+
+
+def heading_to_world(root_quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+    """Rotates heading-frame vectors (B, K, 3) into the world frame by the yaw of
+    ``root_quat`` (B, 4)."""
+    heading = yaw_quat(root_quat)[:, None].expand(-1, vec.shape[1], -1)
+    return quat_apply(heading, vec)
